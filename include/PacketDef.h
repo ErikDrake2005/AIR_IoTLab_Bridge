@@ -1,97 +1,189 @@
 #pragma once
 #include <Arduino.h>
-#define ID_MAX_LEN 16 // quy định số ký tự tối đa cho Device ID
-// --- HEADER CHUNG (20 bytes) ---
+#include <ArduinoJson.h> 
+
+// --- ĐỊNH NGHĨA STRUCT QUEUE (Dùng chung) ---
+typedef struct {
+    uint8_t payload[256];
+    size_t length;
+} LoraQueueMsg;
+
+#define ID_MAX_LEN 16
+
+// --- HEADER (5 Bytes) ---
 struct PacketHeader {
-    char deviceId[ID_MAX_LEN]; 
-    uint32_t counter;          
+    uint8_t nodeId;    // Index trong KeyStore
+    uint32_t counter;  // Chống Replay Attack
 };
 
-// --- CÁC LOẠI GÓI TIN (MsgType) ---
-enum MsgType : uint8_t {
-    TYPE_SENSOR_DATA = 0x01, // Node -> Gateway: Dữ liệu đo đạc
-    TYPE_CMD_CTRL = 0x02, // Gateway -> Node: Lệnh điều khiển (Open, Fan, Mode...)
-    TYPE_CMD_CONFIG = 0x03, // Gateway -> Node: Cài đặt (Time, Cycle)
-    TYPE_RESPONSE = 0x04, // Node -> Gateway: Phản hồi (ACK hoặc ERROR)
-    TYPE_TIME_REQ = 0x05  // Node -> Gateway: Xin cập nhật giờ hệ thống
+// --- DATA TYPE TAGS ---
+enum DataType : uint8_t {
+    DT_END        = 0x00,
+    DT_KEY_TOKEN  = 0x01,
+    DT_VAL_TOKEN  = 0x02,
+    DT_VAL_INT8   = 0x03,
+    DT_VAL_INT16  = 0x04,
+    DT_VAL_INT32  = 0x05,
+    DT_VAL_FLOAT  = 0x06,
+    DT_VAL_RAW_STR= 0x07
 };
 
-// --- MÃ LỆNH CHI TIẾT ---
-enum CmdCode : uint8_t {
-    // 1. NHÓM ĐIỀU KHIỂN (Gateway gửi xuống)
-    CMD_MODE_MANUAL = 10,
-    CMD_MODE_AUTO = 11,
-    CMD_TRIGGER_MEASURE = 12,
-    CMD_STOP_MEASURE = 13,
-    CMD_OPEN_DOOR = 20,
-    CMD_CLOSE_DOOR = 21,
-    CMD_FANS_ON = 22,
-    CMD_FANS_OFF = 23,
-    // 2. NHÓM CẤU HÌNH (Gateway gửi xuống)
-    CMD_SYSTEM_TIME_OK = 30, // Phản hồi giờ cho Time Req
-    CMD_SET_CYCLE = 31, // Cài đặt số lần đo/ngày
-    CMD_SET_SCHEDULE = 32, // Cài đặt lịch đo cụ thể
-    // 3. NHÓM ACK (Node phản hồi thành công)
-    ACK_OK = 100, // Thành công chung chung
-    ACK_OPEN_DOOR_OK = 101, 
-    ACK_CLOSE_DOOR_OK = 102, 
-    ACK_FANS_ON_OK = 103, 
-    ACK_FANS_OFF_OK = 104, 
-    ACK_MODE_MANUAL_OK = 105, 
-    ACK_MODE_AUTO_OK = 106, 
-    ACK_TRIGGER_OK = 107, 
-    ACK_STOP_MEASURE_OK = 108, 
-    ACK_SET_CYCLE_OK = 109, 
-    ACK_SET_TIME_OK = 110,
-    // 4. NHÓM LỖI (Node báo cáo lỗi)
-    ERR_UNKNOWN = 200, // Lệnh không hiểu
-    ERR_BUSY = 201, // Đang bận đo (busy_measuring)
-    ERR_IN_AUTO = 202, // Không thể Manual khi đang Auto (cannot_manual_in_auto)
-    ERR_EXECUTE_FAIL = 203  // Lỗi phần cứng (Sensor lỗi...)
-};
-// --- CẤU TRÚC GÓI TIN (STRUCT) ---
-// 1. Dữ liệu Cảm biến (16 bytes payload)
-struct __attribute__((packed)) SensorData {
-    uint8_t msgType;
-    int16_t temp;
-    uint16_t hum;
-    uint16_t ch4;
-    uint16_t co;
-    uint16_t alc;
-    uint16_t nh3;
-    uint16_t h2;
-};
-// 2. Lệnh Điều khiển đơn giản (2 bytes payload)
-struct __attribute__((packed)) ControlCmd {
-    uint8_t msgType;
-    uint8_t cmdCode;
+// --- SIÊU TỪ ĐIỂN (SUPER DICTIONARY) ---
+// Đã cập nhật đầy đủ các từ khóa mới cho Node
+const char* const DICTIONARY[] = {
+    // [0-9] Các trường chung (Keys)
+    "type", "cmd", "status", "val", "error", "timestamp", "unknown",
+    "mode", "msg", // <--- [MỚI] Thêm mode và msg
+    
+    // [10-29] Các giá trị lệnh/trạng thái (Values)
+    "set_mode", "manual", "auto", "trigger", "stop", 
+    "open_door", "close_door", "fan_on", "fan_off", "fans_on", "fans_off",
+    "ok", "fail", "busy", "done",
+    "stop_measure", "trigger_measure", // <--- [MỚI] Giá trị cmd
+    
+    // [30-49] Cấu hình & Thời gian
+    "config", "set_time", "time_req", "time_sync", // <--- [MỚI] time_sync
+    "year", "month", "day", "hour", "minute", "second", "cycle",
+    "measures_per_day", "set_cycle", // <--- [MỚI] measures_per_day
+    
+    // [50+] Cảm biến & Khác
+    "temp", "hum", "ch4", "co", "alc", "nh3", "h2", "rssi", "snr", "bat", 
+    "device_id", "response", "sensor_data", "data", // <--- [MỚI] data
+    
+    // [ACK Messages] - Giúp nén các câu phản hồi thông dụng
+    "batch_ok", "STOP_OK", "MEASURE_START", "ERR_IN_AUTO", "SYSTEM_BUSY_TIMEOUT",
+    "DOOR_OPENED", "DOOR_CLOSED", "FAN_ON_OK", "FAN_OFF_OK"
 };
 
-// 3. Lệnh Cấu hình & Thời gian (12 bytes payload)
-struct __attribute__((packed)) ConfigCmd {
-    uint8_t msgType; // TYPE_CMD_CONFIG
-    uint8_t cmdCode; // CMD_SET_CYCLE, CMD_SYSTEM_TIME_OK...
-    uint16_t value;  // Dùng cho Set Cycle
-    // Dùng cho Time Sync hoặc Set Schedule (HH:MM:SS)
-    uint16_t year;   
-    uint8_t month;
-    uint8_t day;
-    uint8_t hour;
-    uint8_t minute;
-    uint8_t second;
-};
-// 4. Phản hồi ACK/ERROR (2 bytes payload)
-struct __attribute__((packed)) ResponsePacket {
-    uint8_t msgType; // TYPE_RESPONSE
-    uint8_t ackCode; // ACK_... hoặc ERR_...
-};
-// 5. Yêu cầu đồng bộ giờ (1 byte payload)
-struct __attribute__((packed)) SimplePacket {
-    uint8_t msgType; // TYPE_TIME_REQ
-    uint8_t dummy;   // Padding cho chẵn byte (không bắt buộc nhưng tốt cho AES)
-};
-struct __attribute__((packed)) TriggerCmd {
-    uint8_t msgType;  // TYPE_CMD_CTRL (0x02)
-    uint8_t cmdCode;  // CMD_TRIGGER_MEASURE (12)
-    uint8_t cycle;    // Số chu kỳ đo (1 byte)
+const int DICT_SIZE = sizeof(DICTIONARY) / sizeof(DICTIONARY[0]);
+
+class PacketUtils {
+public:
+    static uint8_t getTokenId(const char* str) {
+        for (uint8_t i = 0; i < DICT_SIZE; i++) {
+            if (strcmp(DICTIONARY[i], str) == 0) return i;
+        }
+        return 0xFF;
+    }
+
+    static const char* getString(uint8_t id) {
+        if (id < DICT_SIZE) return DICTIONARY[id];
+        return "unknown";
+    }
+
+    // --- ENCODER: JSON -> BINARY ---
+    static int encodeJsonToBinary(const JsonDocument& doc, uint8_t* buffer, int maxLen) {
+        int idx = 0;
+        JsonObjectConst root = doc.as<JsonObjectConst>();
+
+        for (JsonPairConst kv : root) {
+            const char* keyStr = kv.key().c_str();
+            
+            // Bỏ qua ID/Device để tiết kiệm
+            if (strcmp(keyStr, "device_id") == 0 || strcmp(keyStr, "device") == 0) continue;
+
+            uint8_t keyToken = getTokenId(keyStr);
+            if (keyToken == 0xFF) {
+                // [FIX QUAN TRỌNG] Nếu key không có trong từ điển, thay vì bỏ qua,
+                // ta có thể chọn bỏ qua (như hiện tại) HOẶC in ra debug để biết.
+                // Với file mới này đã đủ key, nên giữ nguyên logic bỏ qua là an toàn.
+                continue; 
+            }
+
+            if (idx + 10 >= maxLen) break; 
+
+            buffer[idx++] = DT_KEY_TOKEN;
+            buffer[idx++] = keyToken;
+
+            JsonVariantConst val = kv.value();
+            
+            if (val.is<const char*>()) {
+                const char* s = val.as<const char*>();
+                uint8_t valToken = getTokenId(s);
+                if (valToken != 0xFF) {
+                    buffer[idx++] = DT_VAL_TOKEN;
+                    buffer[idx++] = valToken;
+                } else {
+                    int slen = strlen(s);
+                    if (idx + 2 + slen < maxLen) {
+                        buffer[idx++] = DT_VAL_RAW_STR;
+                        buffer[idx++] = (uint8_t)slen;
+                        memcpy(buffer + idx, s, slen);
+                        idx += slen;
+                    }
+                }
+            }
+            else if (val.is<float>() || val.is<int>()) { // Support cả int
+                 float f = val.as<float>();
+                 if (f == (int32_t)f) {
+                     int32_t i32 = (int32_t)f;
+                     if (i32 >= -128 && i32 <= 127) {
+                         buffer[idx++] = DT_VAL_INT8;
+                         buffer[idx++] = (int8_t)i32;
+                     } else if (i32 >= -32768 && i32 <= 32767) {
+                         buffer[idx++] = DT_VAL_INT16;
+                         int16_t temp = (int16_t)i32;
+                         memcpy(buffer+idx, &temp, 2); idx+=2;
+                     } else {
+                         buffer[idx++] = DT_VAL_INT32;
+                         memcpy(buffer+idx, &i32, 4); idx+=4;
+                     }
+                 } else {
+                     buffer[idx++] = DT_VAL_FLOAT;
+                     memcpy(buffer+idx, &f, 4); idx+=4;
+                 }
+            }
+        }
+        buffer[idx++] = DT_END;
+        return idx;
+    }
+
+    // --- DECODER: BINARY -> JSON ---
+    static void decodeBinaryToJson(const uint8_t* buffer, int len, JsonDocument& doc) {
+        int idx = 0;
+        const char* currentKey = nullptr;
+
+        while (idx < len) {
+            uint8_t type = buffer[idx++];
+            if (type == DT_END) break;
+
+            if (type == DT_KEY_TOKEN) {
+                uint8_t id = buffer[idx++];
+                currentKey = getString(id);
+            }
+            else if (currentKey != nullptr) {
+                switch (type) {
+                    case DT_VAL_TOKEN:
+                        doc[currentKey] = getString(buffer[idx++]);
+                        break;
+                    case DT_VAL_INT8:
+                        doc[currentKey] = (int8_t)buffer[idx++];
+                        break;
+                    case DT_VAL_INT16: {
+                        int16_t v; memcpy(&v, buffer+idx, 2); idx+=2;
+                        doc[currentKey] = v;
+                        break;
+                    }
+                    case DT_VAL_INT32: {
+                        int32_t v; memcpy(&v, buffer+idx, 4); idx+=4;
+                        doc[currentKey] = v;
+                        break;
+                    }
+                    case DT_VAL_FLOAT: {
+                        float v; memcpy(&v, buffer+idx, 4); idx+=4;
+                        doc[currentKey] = (float)((int)(v * 100 + 0.5)) / 100.0;
+                        break;
+                    }
+                    case DT_VAL_RAW_STR: {
+                        uint8_t lenStr = buffer[idx++];
+                        char tmp[256]; memcpy(tmp, buffer+idx, lenStr); tmp[lenStr] = 0;
+                        doc[currentKey] = String(tmp);
+                        idx += lenStr;
+                        break;
+                    }
+                }
+                currentKey = nullptr; 
+            }
+        }
+    }
 };
