@@ -30,31 +30,49 @@ enum DataType : uint8_t {
 
 // --- SIÊU TỪ ĐIỂN (SUPER DICTIONARY) ---
 // Đã cập nhật đầy đủ các từ khóa mới cho Node
-const char* const DICTIONARY[] = {
-    // [0-9] Các trường chung (Keys)
-    "type", "cmd", "status", "val", "error", "timestamp", "unknown",
-    "mode", "msg", // <--- [MỚI] Thêm mode và msg
-    
-    // [10-29] Các giá trị lệnh/trạng thái (Values)
-    "set_mode", "manual", "auto", "trigger", "stop", 
-    "open_door", "close_door", "fan_on", "fan_off", "fans_on", "fans_off",
-    "ok", "fail", "busy", "done",
-    "stop_measure", "trigger_measure", // <--- [MỚI] Giá trị cmd
-    
-    // [30-49] Cấu hình & Thời gian
-    "config", "set_time", "time_req", "time_sync", // <--- [MỚI] time_sync
-    "year", "month", "day", "hour", "minute", "second", "cycle",
-    "measures_per_day", "set_cycle", // <--- [MỚI] measures_per_day
-    
-    // [50+] Cảm biến & Khác
-    "temp", "hum", "ch4", "co", "alc", "nh3", "h2", "rssi", "snr", "bat", 
-    "device_id", "response", "sensor_data", "data", // <--- [MỚI] data
-    
-    // [ACK Messages] - Giúp nén các câu phản hồi thông dụng
-    "batch_ok", "STOP_OK", "MEASURE_START", "ERR_IN_AUTO", "SYSTEM_BUSY_TIMEOUT",
-    "DOOR_OPENED", "DOOR_CLOSED", "FAN_ON_OK", "FAN_OFF_OK"
-};
+#pragma once
+#include <Arduino.h>
+#include <ArduinoJson.h> 
 
+// ... (Giữ nguyên các Struct Header, LoraQueueMsg...)
+
+// --- SIÊU TỪ ĐIỂN (SUPER DICTIONARY) ---
+const char* const DICTIONARY[] = {
+    // --- [KEYS] TỪ KHÓA LỆNH ---
+    "type", "cmd", "status", "val", "error", "timestamp", "unknown",
+    
+    // [MỚI] Key định dạng mới (Key-Value)
+    "set_state",        // Thay cho trigger/stop
+    "set_door",         // Thay cho open_door/close_door
+    "set_fans",         // Thay cho fans_on/fans_off
+    "set_time",         // Vừa là lệnh, vừa chứa giá trị chuỗi
+    "mode",             // set_mode
+    "cycle_manual",     // Tách biệt với cycle cũ
+    "measures_per_day", // Auto config
+    "device",           // Device ID
+    
+    // [CŨ] Key cũ (Giữ để tương thích)
+    "cycle", "msg", 
+    
+    // --- [OTA KEYS] ---
+    "ota_start", "ota_chunk", "ota_finish", "total_size", "data",
+
+    // --- [VALUES] GIÁ TRỊ ---
+    // [MỚI] Value cho các Key mới
+    "measure", "stop", "idle",  // Value của set_state
+    "open", "close",            // Value của set_door
+    "on", "off",                // Value của set_fans
+    "manual", "auto",           // Value của mode
+
+    // [CŨ] Value cũ (Giữ để tương thích)
+    "trigger_measure", "stop_measure",
+    "open_door", "close_door", 
+    "fans_on", "fans_off",
+    "ok", "fail", "busy", "done",
+    
+    // --- [SENSOR DATA KEYS] ---
+    "sensor_data", "temp", "hum", "co", "nh3", "h2", "alc", "ch4"
+};
 const int DICT_SIZE = sizeof(DICTIONARY) / sizeof(DICTIONARY[0]);
 
 class PacketUtils {
