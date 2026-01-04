@@ -2,7 +2,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h> 
 
-// --- ĐỊNH NGHĨA STRUCT QUEUE (Dùng chung) ---
+// --- 1. CẤU TRÚC GÓI TIN & HÀNG ĐỢI ---
 typedef struct {
     uint8_t payload[256];
     size_t length;
@@ -10,86 +10,79 @@ typedef struct {
 
 #define ID_MAX_LEN 16
 
-// --- HEADER (5 Bytes) ---
 struct PacketHeader {
-    uint8_t nodeId;    // Index trong KeyStore
-    uint32_t counter;  // Chống Replay Attack
+    uint8_t nodeId;    // Index định danh thiết bị
+    uint32_t counter;  // Chống tấn công phát lại (Replay Attack)
 };
 
-// --- DATA TYPE TAGS ---
+// --- 2. CÁC LOẠI DỮ LIỆU (TAGS) ---
 enum DataType : uint8_t {
-    DT_END        = 0x00,
-    DT_KEY_TOKEN  = 0x01,
-    DT_VAL_TOKEN  = 0x02,
-    DT_VAL_INT8   = 0x03,
-    DT_VAL_INT16  = 0x04,
-    DT_VAL_INT32  = 0x05,
-    DT_VAL_FLOAT  = 0x06,
-    DT_VAL_RAW_STR= 0x07
+    DT_END         = 0x00,
+    DT_KEY_TOKEN   = 0x01,
+    DT_VAL_TOKEN   = 0x02,
+    DT_VAL_INT8    = 0x03,
+    DT_VAL_INT16   = 0x04,
+    DT_VAL_INT32   = 0x05,
+    DT_VAL_FLOAT   = 0x06,
+    DT_VAL_RAW_STR = 0x07  // Dùng khi chuỗi không có trong từ điển
 };
 
-// --- SIÊU TỪ ĐIỂN (SUPER DICTIONARY) ---
-// Đã cập nhật đầy đủ các từ khóa mới cho Node
-#pragma once
-#include <Arduino.h>
-#include <ArduinoJson.h> 
+// --- 3. SIÊU TỪ ĐIỂN (SUPER DICTIONARY) ---
+// QUAN TRỌNG: Thứ tự chuỗi trong mảng này phải GIỐNG HỆT nhau 
+// ở cả Gateway và Bridge/Node. Không được lệch index.
 
-// ... (Giữ nguyên các Struct Header, LoraQueueMsg...)
-
-// --- SIÊU TỪ ĐIỂN (SUPER DICTIONARY) ---
 const char* const DICTIONARY[] = {
-    // --- [KEYS] TỪ KHÓA LỆNH ---
-    "type", "cmd", "status", "val", "error", "timestamp", "unknown",
+    // --- [KEYS] TỪ KHÓA CỦA NODE ---
+    "type", "cmd", "msg", "value", "error", "timestamp",
+    "set_state", "set_door", "set_fans", "set_time", 
+    "mode", "cycle_manual", "measures_per_day", "device", "device_id",
     
-    // [MỚI] Key định dạng mới (Key-Value)
-    "set_state",        // Thay cho trigger/stop
-    "set_door",         // Thay cho open_door/close_door
-    "set_fans",         // Thay cho fans_on/fans_off
-    "set_time",         // Vừa là lệnh, vừa chứa giá trị chuỗi
-    "mode",             // set_mode
-    "cycle_manual",     // Tách biệt với cycle cũ
-    "measures_per_day", // Auto config
-    "device",           // Device ID
-    
-    // [CŨ] Key cũ (Giữ để tương thích)
-    "cycle", "msg", 
-    
-    // --- [OTA KEYS] ---
-    "ota_start", "ota_chunk", "ota_finish", "total_size", "data",
+    // --- [SENSOR DATA] ---
+    "temp", "hum", "ch4", "co", "nh3", "h2", "alc", "rssi", "node_id",
 
-    // --- [VALUES] GIÁ TRỊ ---
-    // [MỚI] Value cho các Key mới
-    "measure", "stop", "idle",  // Value của set_state
-    "open", "close",            // Value của set_door
-    "on", "off",                // Value của set_fans
-    "manual", "auto",           // Value của mode
-
-    // [CŨ] Value cũ (Giữ để tương thích)
-    "trigger_measure", "stop_measure",
-    "open_door", "close_door", 
-    "fans_on", "fans_off",
-    "ok", "fail", "busy", "done",
+    // --- [VALUES] GIÁ TRỊ LỆNH ---
+    "ack", "data",                 // Response Type
+    "manual", "auto",              // Mode
+    "measure", "stop",             // State
+    "trigger_measure", "stop_measure", // Cmd
+    "open", "close",               // Door val
+    "on", "off",                   // Fan val
     
-    // --- [SENSOR DATA KEYS] ---
-    "sensor_data", "temp", "hum", "co", "nh3", "h2", "alc", "ch4"
+    // --- [MỚI - TỐI ƯU] CÁC CÂU PHẢN HỒI THƯỜNG GẶP (Tiết kiệm 10-15 bytes/gói) ---
+    "MEASURE_STARTED",
+    "MEASURE_STOPPED",
+    "DOOR_OPENED",
+    "DOOR_CLOSED",
+    "FANS_ON",
+    "FANS_OFF",
+    "CONFIG_OK",
+    "ERR_IN_AUTO",
+    "BUSY",
+    "JSON_ERR",
+    "do_full_measure"
 };
+
 const int DICT_SIZE = sizeof(DICTIONARY) / sizeof(DICTIONARY[0]);
 
+// --- 4. LỚP TIỆN ÍCH NÉN/GIẢI NÉN ---
 class PacketUtils {
 public:
+    // Tìm ID của chuỗi trong từ điển
     static uint8_t getTokenId(const char* str) {
         for (uint8_t i = 0; i < DICT_SIZE; i++) {
             if (strcmp(DICTIONARY[i], str) == 0) return i;
         }
-        return 0xFF;
+        return 0xFF; // Không tìm thấy
     }
 
+    // Lấy chuỗi từ ID
     static const char* getString(uint8_t id) {
         if (id < DICT_SIZE) return DICTIONARY[id];
         return "unknown";
     }
 
     // --- ENCODER: JSON -> BINARY ---
+    // Nén JsonDocument thành mảng byte để gửi LoRa
     static int encodeJsonToBinary(const JsonDocument& doc, uint8_t* buffer, int maxLen) {
         int idx = 0;
         JsonObjectConst root = doc.as<JsonObjectConst>();
@@ -97,31 +90,33 @@ public:
         for (JsonPairConst kv : root) {
             const char* keyStr = kv.key().c_str();
             
-            // Bỏ qua ID/Device để tiết kiệm
+            // Bỏ qua các key không cần thiết gửi qua LoRa để tiết kiệm
             if (strcmp(keyStr, "device_id") == 0 || strcmp(keyStr, "device") == 0) continue;
 
             uint8_t keyToken = getTokenId(keyStr);
             if (keyToken == 0xFF) {
-                // [FIX QUAN TRỌNG] Nếu key không có trong từ điển, thay vì bỏ qua,
-                // ta có thể chọn bỏ qua (như hiện tại) HOẶC in ra debug để biết.
-                // Với file mới này đã đủ key, nên giữ nguyên logic bỏ qua là an toàn.
+                // Key lạ => Bỏ qua (hoặc có thể gửi dạng RAW nếu muốn, nhưng ở đây ta bỏ qua cho gọn)
                 continue; 
             }
 
-            if (idx + 10 >= maxLen) break; 
+            if (idx + 10 >= maxLen) break; // Tràn buffer
 
             buffer[idx++] = DT_KEY_TOKEN;
             buffer[idx++] = keyToken;
 
             JsonVariantConst val = kv.value();
             
+            // 1. Xử lý chuỗi (String)
             if (val.is<const char*>()) {
                 const char* s = val.as<const char*>();
                 uint8_t valToken = getTokenId(s);
+                
                 if (valToken != 0xFF) {
+                    // Chuỗi có trong từ điển -> Nén còn 2 bytes
                     buffer[idx++] = DT_VAL_TOKEN;
                     buffer[idx++] = valToken;
                 } else {
+                    // Chuỗi lạ -> Gửi nguyên bản (Tốn dung lượng nhưng an toàn)
                     int slen = strlen(s);
                     if (idx + 2 + slen < maxLen) {
                         buffer[idx++] = DT_VAL_RAW_STR;
@@ -131,8 +126,11 @@ public:
                     }
                 }
             }
-            else if (val.is<float>() || val.is<int>()) { // Support cả int
+            // 2. Xử lý số (Float/Int)
+            else if (val.is<float>() || val.is<int>()) { 
                  float f = val.as<float>();
+                 
+                 // Kiểm tra xem có phải số nguyên không để nén nhỏ hơn
                  if (f == (int32_t)f) {
                      int32_t i32 = (int32_t)f;
                      if (i32 >= -128 && i32 <= 127) {
@@ -147,16 +145,18 @@ public:
                          memcpy(buffer+idx, &i32, 4); idx+=4;
                      }
                  } else {
+                     // Số thực (Float) -> 5 bytes
                      buffer[idx++] = DT_VAL_FLOAT;
                      memcpy(buffer+idx, &f, 4); idx+=4;
                  }
             }
         }
-        buffer[idx++] = DT_END;
+        buffer[idx++] = DT_END; // Kết thúc gói
         return idx;
     }
 
     // --- DECODER: BINARY -> JSON ---
+    // Giải mã mảng byte LoRa thành JsonDocument
     static void decodeBinaryToJson(const uint8_t* buffer, int len, JsonDocument& doc) {
         int idx = 0;
         const char* currentKey = nullptr;
@@ -189,18 +189,23 @@ public:
                     }
                     case DT_VAL_FLOAT: {
                         float v; memcpy(&v, buffer+idx, 4); idx+=4;
+                        // Làm tròn 2 số lẻ cho đẹp (VD: 30.550000 -> 30.55)
                         doc[currentKey] = (float)((int)(v * 100 + 0.5)) / 100.0;
                         break;
                     }
                     case DT_VAL_RAW_STR: {
                         uint8_t lenStr = buffer[idx++];
-                        char tmp[256]; memcpy(tmp, buffer+idx, lenStr); tmp[lenStr] = 0;
-                        doc[currentKey] = String(tmp);
-                        idx += lenStr;
+                        char tmp[256]; 
+                        if (idx + lenStr <= len) {
+                            memcpy(tmp, buffer+idx, lenStr); 
+                            tmp[lenStr] = 0;
+                            doc[currentKey] = String(tmp);
+                            idx += lenStr;
+                        }
                         break;
                     }
                 }
-                currentKey = nullptr; 
+                currentKey = nullptr; // Reset sau khi gán value xong
             }
         }
     }
