@@ -11,7 +11,7 @@ typedef struct {
 #define ID_MAX_LEN 16
 
 struct PacketHeader {
-    uint8_t nodeId;    // Index định danh thiết bị
+    uint8_t nodeId;    // Index định danh thiết bị (Byte 0 công khai)
     uint32_t counter;  // Chống tấn công phát lại (Replay Attack)
 };
 
@@ -29,18 +29,18 @@ enum DataType : uint8_t {
 
 // --- 3. SIÊU TỪ ĐIỂN (SUPER DICTIONARY) ---
 // QUAN TRỌNG: Thứ tự chuỗi trong mảng này phải GIỐNG HỆT nhau 
-// ở cả Gateway và Bridge/Node. Không được lệch index.
+// ở cả Gateway, Bridge và Node. Không được lệch index.
 
 const char* const DICTIONARY[] = {
-    // --- [KEYS] TỪ KHÓA CỦA NODE ---
+    // [0-14] CÁC KEY CƠ BẢN & CẤU HÌNH
     "type", "cmd", "msg", "value", "error", "timestamp",
     "set_state", "set_door", "set_fans", "set_time", 
     "mode", "cycle_manual", "measures_per_day", "device", "device_id",
     
-    // --- [SENSOR DATA] ---
-    "temp", "hum", "ch4", "co", "nh3", "h2", "alc", "rssi", "node_id",
+    // [15-24] DỮ LIỆU CẢM BIẾN (Keys)
+    "temp", "hum", "ch4", "co", "nh3", "h2", "alc", "rssi", "node_id", "mics",
 
-    // --- [VALUES] GIÁ TRỊ LỆNH ---
+    // [25-36] GIÁ TRỊ LỆNH (Values)
     "ack", "data",                 // Response Type
     "manual", "auto",              // Mode
     "measure", "stop",             // State
@@ -48,7 +48,7 @@ const char* const DICTIONARY[] = {
     "open", "close",               // Door val
     "on", "off",                   // Fan val
     
-    // --- [MỚI - TỐI ƯU] CÁC CÂU PHẢN HỒI THƯỜNG GẶP (Tiết kiệm 10-15 bytes/gói) ---
+    // CÁC CÂU PHẢN HỒI THƯỜNG GẶP (Response Strings)
     "MEASURE_STARTED",
     "MEASURE_STOPPED",
     "DOOR_OPENED",
@@ -59,15 +59,36 @@ const char* const DICTIONARY[] = {
     "ERR_IN_AUTO",
     "BUSY",
     "JSON_ERR",
-    "do_full_measure"
+    "do_full_measure",
+    "dht",          // error: dht
+    "sht",          // error: sht
+    "soil_ss",      // error: soil_ss
+    "bh1750",       // error: bh1750
+    "pzem",         // error: pzem
+    "ds18b20",      // error: ds18b20
+    "slave",        // error: slave (Lỗi Modbus)
+    "time_req",      // Dùng cho type: time_req
+
+    //Du phong
+    "DeFire0",
+    "DeFire1",
+    "DeFire2",
+    "DeFire3",
+    "DeFire4",
+    "DeFire5",
+    "DeFire6",
+    "DeFire7",
+    "DeFire8",
+    "DeFire9"
 };
 
+// Tính toán kích thước từ điển tự động
 const int DICT_SIZE = sizeof(DICTIONARY) / sizeof(DICTIONARY[0]);
 
 // --- 4. LỚP TIỆN ÍCH NÉN/GIẢI NÉN ---
 class PacketUtils {
 public:
-    // Tìm ID của chuỗi trong từ điển
+    // Tìm ID của chuỗi trong từ điển (O(N) - N nhỏ nên rất nhanh)
     static uint8_t getTokenId(const char* str) {
         for (uint8_t i = 0; i < DICT_SIZE; i++) {
             if (strcmp(DICTIONARY[i], str) == 0) return i;
@@ -75,7 +96,7 @@ public:
         return 0xFF; // Không tìm thấy
     }
 
-    // Lấy chuỗi từ ID
+    // Lấy chuỗi từ ID (O(1))
     static const char* getString(uint8_t id) {
         if (id < DICT_SIZE) return DICTIONARY[id];
         return "unknown";
@@ -90,12 +111,12 @@ public:
         for (JsonPairConst kv : root) {
             const char* keyStr = kv.key().c_str();
             
-            // Bỏ qua các key không cần thiết gửi qua LoRa để tiết kiệm
+            // Bỏ qua các key định danh (vì ID đã nằm ở Header gói tin)
             if (strcmp(keyStr, "device_id") == 0 || strcmp(keyStr, "device") == 0) continue;
 
             uint8_t keyToken = getTokenId(keyStr);
             if (keyToken == 0xFF) {
-                // Key lạ => Bỏ qua (hoặc có thể gửi dạng RAW nếu muốn, nhưng ở đây ta bỏ qua cho gọn)
+                // Key lạ => Bỏ qua để tiết kiệm (hoặc có thể code thêm để gửi raw)
                 continue; 
             }
 
@@ -112,7 +133,7 @@ public:
                 uint8_t valToken = getTokenId(s);
                 
                 if (valToken != 0xFF) {
-                    // Chuỗi có trong từ điển -> Nén còn 2 bytes
+                    // Chuỗi có trong từ điển (VD: "slave") -> Nén còn 2 bytes
                     buffer[idx++] = DT_VAL_TOKEN;
                     buffer[idx++] = valToken;
                 } else {
@@ -133,6 +154,7 @@ public:
                  // Kiểm tra xem có phải số nguyên không để nén nhỏ hơn
                  if (f == (int32_t)f) {
                      int32_t i32 = (int32_t)f;
+                     // Nén tối đa: int8 (1 byte), int16 (2 bytes), int32 (4 bytes)
                      if (i32 >= -128 && i32 <= 127) {
                          buffer[idx++] = DT_VAL_INT8;
                          buffer[idx++] = (int8_t)i32;
