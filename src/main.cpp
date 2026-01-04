@@ -8,30 +8,32 @@
 #include "KeyConfig.h"
 
 // --- GLOBALS ---
-HardwareSerial uart(1);
-uint32_t msgCounter = 0; // Bộ đếm gói tin
+HardwareSerial uart(1);  // UART nối với Node chính
+uint32_t msgCounter = 0; // Bộ đếm gói tin chống trùng lặp
 
 // --- PROTOTYPES ---
 void onLoRaReceive(int packetSize);
 
 void setup() {
+    // 1. Debug Serial (USB)
     Serial.begin(115200);
     
-    // 1. Init UART Bridge (Kết nối với Main MCU)
-    uart.setRxBufferSize(2048);
+    // 2. Init UART Bridge (Kết nối với Main Node)
+    // Lưu ý: RX_PIN và TX_PIN phải đấu chéo với Node (TX Bridge -> RX Node)
+    uart.setRxBufferSize(2048); // Tăng buffer để chứa JSON dài
     uart.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-    Serial.printf("--- BRIDGE STARTED: %s (ID: %d) ---\n", MY_DEVICE_NAME, MY_NODE_INDEX);
+    Serial.printf("\n\n--- BRIDGE STARTED: %s (ID: %d) ---\n", MY_DEVICE_NAME, MY_NODE_INDEX);
 
-    // 2. Init LoRa
+    // 3. Init LoRa
     SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_CS_PIN);
     LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
     
     if (!LoRa.begin(LORA_FREQ)) {
-        Serial.println("[LoRa] Init Failed!");
+        Serial.println("[LoRa] Init Failed! Check wiring.");
         while (1);
     }
     
-    // Cài đặt LoRa giống hệt Gateway
+    // Cài đặt LoRa khớp hoàn toàn với Gateway
     LoRa.setTxPower(LORA_TX_POWER);
     LoRa.setSpreadingFactor(LORA_SF);
     LoRa.setSignalBandwidth(LORA_BW);
@@ -39,56 +41,75 @@ void setup() {
     LoRa.setSyncWord(LORA_SYNC_WORD);
     LoRa.enableCrc();
     
-    Serial.println("[LoRa] Ready.");
+    Serial.println("[LoRa] Ready & Listening...");
 }
 
 void loop() {
-    // 1. Kiểm tra LoRa (Nhận dữ liệu từ Gateway)
+    // ============================================================
+    // 1. CHIỀU VỀ: Gateway -> Bridge -> Node (LoRa RX)
+    // ============================================================
     int packetSize = LoRa.parsePacket();
     if (packetSize) {
         onLoRaReceive(packetSize);
     }
 
-    // 2. Kiểm tra UART (Nhận dữ liệu từ Main MCU để gửi đi)
+    // ============================================================
+    // 2. CHIỀU ĐI: Node -> Bridge -> Gateway (UART RX)
+    // ============================================================
     if (uart.available()) {
+        // Đọc chuỗi từ Node gửi sang (Format: {"..."}|CRC_HEX\n)
         String input = uart.readStringUntil('\n');
-        input.trim();
-        if (input.length() > 0) {
-            Serial.println("[UART] Received: " + input);
+        input.trim(); // Xóa khoảng trắng thừa đầu đuôi
 
-            // Parse JSON
+        if (input.length() > 0) {
+            Serial.println("[UART RAW] " + input);
+
+            // --- QUAN TRỌNG: CẮT BỎ ĐUÔI CRC (|CRC) ---
+            // Node gửi kèm CRC để check, nhưng Bridge cần JSON thuần để nén
+            int separatorIdx = input.lastIndexOf('|');
+            if (separatorIdx != -1) {
+                input = input.substring(0, separatorIdx); // Lấy phần JSON phía trước dấu |
+            }
+
+            // --- Parse JSON ---
             JsonDocument doc;
             DeserializationError error = deserializeJson(doc, input);
 
             if (!error) {
-                // --- BƯỚC 1: Chuẩn bị Header ---
+                // --- BƯỚC A: Chuẩn bị Header ---
                 PacketHeader head;
-                head.nodeId = MY_NODE_INDEX; // ID số của mình
+                head.nodeId = MY_NODE_INDEX; // ID định danh của Bridge này
                 head.counter = msgCounter++;
 
-                // --- BƯỚC 2: Nén JSON sang Binary ---
+                // --- BƯỚC B: Nén JSON sang Binary (Tokenization) ---
+                // Dùng PacketUtils để nén dựa trên "Siêu từ điển"
                 uint8_t payloadBuf[200];
-                // Dùng PacketUtils để nén tự động dựa trên Từ điển
                 int payloadLen = PacketUtils::encodeJsonToBinary(doc, payloadBuf, sizeof(payloadBuf));
 
-                // --- BƯỚC 3: Mã hóa ---
-                uint8_t encryptedBuf[256];
-                int finalLen = Security::encryptBinary(head, payloadBuf, payloadLen, encryptedBuf, MY_AES_KEY);
+                if (payloadLen > 0) {
+                    // --- BƯỚC C: Mã hóa bảo mật (AES-128) ---
+                    uint8_t encryptedBuf[256];
+                    // Mã hóa cả Header + Payload
+                    int finalLen = Security::encryptBinary(head, payloadBuf, payloadLen, encryptedBuf, MY_AES_KEY);
 
-                // --- BƯỚC 4: Gửi LoRa ---
-                LoRa.beginPacket();
-                LoRa.write(encryptedBuf, finalLen);
-                LoRa.endPacket();
-                
-                Serial.printf("[LoRa TX] Sent %d bytes (Counter: %d)\n", finalLen, head.counter);
+                    // --- BƯỚC D: Gửi LoRa ---
+                    LoRa.beginPacket();
+                    LoRa.write(encryptedBuf, finalLen);
+                    LoRa.endPacket();
+                    
+                    Serial.printf("[LoRa TX] Sent %d bytes (MsgCount: %d)\n", finalLen, head.counter);
+                } else {
+                    Serial.println("[Bridge] Encode Failed! (Key not in Dictionary?)");
+                }
             } else {
-                Serial.println("[UART] JSON Error!");
+                Serial.print("[Bridge] JSON Parse Error: ");
+                Serial.println(error.c_str());
             }
         }
     }
 }
 
-// --- XỬ LÝ NHẬN LORA (Gateway -> Node) ---
+// --- HÀM XỬ LÝ NHẬN LORA ---
 void onLoRaReceive(int packetSize) {
     if (packetSize > 256) return;
     
@@ -101,27 +122,26 @@ void onLoRaReceive(int packetSize) {
     // 1. Giải mã (Decrypt)
     PacketHeader head;
     uint8_t decryptedPayload[200];
-    // Hàm decryptBinary sẽ tự tách Header và Payload
+    // Key để giải mã phải khớp với Key mà Gateway dùng để mã hóa cho Node này
     int payloadLen = Security::decryptBinary(buf, packetSize, head, decryptedPayload, MY_AES_KEY);
 
     if (payloadLen >= 0) {
-        // Kiểm tra xem gói tin có phải gửi cho mình không (nếu Gateway gửi Broadcast hoặc Unicast)
-        // Hiện tại Gateway gửi xuống thì Node nào nhận được cứ giải mã, 
-        // sai Key thì payloadLen sẽ ra rác hoặc checksum fail (nếu có).
-        
-        Serial.printf("[LoRa RX] From Gateway, Counter: %d\n", head.counter);
+        Serial.printf("[LoRa RX] Valid Pkt from Gateway (Count: %d)\n", head.counter);
 
         // 2. Giải nén (Binary -> JSON)
         JsonDocument doc;
         PacketUtils::decodeBinaryToJson(decryptedPayload, payloadLen, doc);
 
-        // 3. Đẩy ra UART cho Main MCU xử lý
+        // 3. Đẩy ra UART xuống Node Main
+        // Node Main nhận lệnh dạng JSON thuần + \n
         String jsonOutput;
         serializeJson(doc, jsonOutput);
-        uart.println(jsonOutput); // Gửi: {"cmd":"open_door","val":1}
         
-        Serial.println("[UART TX] Forwarded: " + jsonOutput);
+        uart.println(jsonOutput); 
+        
+        Serial.println("[UART TX] Forwarded to Node: " + jsonOutput);
     } else {
-        Serial.println("[LoRa RX] Decrypt Failed (Wrong Key?)");
+        // Nếu decrypt thất bại (thường do sai Key hoặc nhiễu)
+        Serial.println("[LoRa RX] Decrypt Failed (Ignored)");
     }
 }
