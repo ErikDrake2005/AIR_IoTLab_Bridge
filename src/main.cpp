@@ -16,6 +16,7 @@ void onLoRaReceive(int packetSize);
 
 void setup() {
     // 1. Debug Serial (USB)
+    setCpuFrequencyMhz(80); 
     Serial.begin(115200);
     
     // 2. Init UART Bridge (Kết nối với Main Node)
