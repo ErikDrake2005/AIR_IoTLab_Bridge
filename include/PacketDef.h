@@ -11,8 +11,9 @@ typedef struct {
 #define ID_MAX_LEN 16
 
 struct PacketHeader {
-    uint8_t nodeId;    // Index định danh thiết bị (Byte 0 công khai)
-    uint32_t counter;  // Chống tấn công phát lại (Replay Attack)
+    uint8_t nodeId;    // Index định danh thiết bị
+    uint8_t type;      // [QUAN TRỌNG] Loại gói tin (0: Data, 1: Cmd, 2: Ack...)
+    uint32_t counter;  // Chống Replay Attack
 };
 
 // --- 2. CÁC LOẠI DỮ LIỆU (TAGS) ---
@@ -24,71 +25,49 @@ enum DataType : uint8_t {
     DT_VAL_INT16   = 0x04,
     DT_VAL_INT32   = 0x05,
     DT_VAL_FLOAT   = 0x06,
-    DT_VAL_RAW_STR = 0x07  // Dùng khi chuỗi không có trong từ điển
+    DT_VAL_RAW_STR = 0x07
 };
 
 // --- 3. SIÊU TỪ ĐIỂN (SUPER DICTIONARY) ---
-// QUAN TRỌNG: Thứ tự chuỗi trong mảng này phải GIỐNG HỆT nhau 
-// ở cả Gateway, Bridge và Node. Không được lệch index.
-
+// Đã bổ sung đầy đủ các lệnh hệ thống (EN, pin...) và cảm biến
 const char* const DICTIONARY[] = {
-    // [0-14] CÁC KEY CƠ BẢN & CẤU HÌNH
-    "type", "cmd", "msg", "value", "error", "timestamp",
+    // --- [GROUP A] CÁC KEY HỆ THỐNG (Dùng cho StateMachine) ---
+    "type", "id", "cmd", "timestamp", "status", "info", "error",
+    "batt", "bridge_volt", "EN", "pin", "ack", "msg", "value",
+    
+    // --- [GROUP B] CÁC KEY CẤU HÌNH NODE ---
     "set_state", "set_door", "set_fans", "set_time", 
     "mode", "cycle_manual", "measures_per_day", "device", "device_id",
     
-    // [15-24] DỮ LIỆU CẢM BIẾN (Keys)
+    // --- [GROUP C] DỮ LIỆU CẢM BIẾN ---
     "temp", "hum", "ch4", "co", "nh3", "h2", "alc", "rssi", "node_id", "mics",
 
-    // [25-36] GIÁ TRỊ LỆNH (Values)
-    "ack", "data",                 // Response Type
-    "manual", "auto",              // Mode
-    "measure", "stop",             // State
-    "trigger_measure", "stop_measure", // Cmd
-    "open", "close",               // Door val
-    "on", "off",                   // Fan val
+    // --- [GROUP D] GIÁ TRỊ (VALUES) ---
+    "data", "manual", "auto", "measure", "stop", 
+    "trigger_measure", "stop_measure", "open", "close", "on", "off",
     
-    // CÁC CÂU PHẢN HỒI THƯỜNG GẶP (Response Strings)
-    "MEASURE_STARTED",
-    "MEASURE_STOPPED",
-    "DOOR_OPENED",
-    "DOOR_CLOSED",
-    "FANS_ON",
-    "FANS_OFF",
-    "CONFIG_OK",
-    "ERR_IN_AUTO",
-    "BUSY",
-    "JSON_ERR",
-    "do_full_measure",
-    "dht",          // error: dht
-    "sht",          // error: sht
-    "soil_ss",      // error: soil_ss
-    "bh1750",       // error: bh1750
-    "pzem",         // error: pzem
-    "ds18b20",      // error: ds18b20
-    "slave",        // error: slave (Lỗi Modbus)
-    "time_req",      // Dùng cho type: time_req
+    // --- [GROUP E] THÔNG BÁO TRẠNG THÁI ---
+    "MEASURE_STARTED", "MEASURE_STOPPED",
+    "DOOR_OPENED", "DOOR_CLOSED",
+    "FANS_ON", "FANS_OFF",
+    "CONFIG_OK", "ERR_IN_AUTO", "BUSY", "JSON_ERR",
+    "do_full_measure", "time_req",
 
-    //Du phong
-    "DeFire0",
-    "DeFire1",
-    "DeFire2",
-    "DeFire3",
-    "DeFire4",
-    "DeFire5",
-    "DeFire6",
-    "DeFire7",
-    "DeFire8",
-    "DeFire9"
+    // --- [GROUP F] MÃ LỖI CẢM BIẾN ---
+    "dht", "sht", "soil_ss", "bh1750", "pzem", "ds18b20", "slave",
+
+    // --- [GROUP G] DỰ PHÒNG (DEF) ---
+    "DeFire0", "DeFire1", "DeFire2", "DeFire3", "DeFire4",
+    "DeFire5", "DeFire6", "DeFire7", "DeFire8", "DeFire9"
 };
 
-// Tính toán kích thước từ điển tự động
+// Tính toán kích thước
 const int DICT_SIZE = sizeof(DICTIONARY) / sizeof(DICTIONARY[0]);
 
-// --- 4. LỚP TIỆN ÍCH NÉN/GIẢI NÉN ---
+// --- 4. LỚP TIỆN ÍCH NÉN/GIẢI NÉN & CRC ---
 class PacketUtils {
 public:
-    // Tìm ID của chuỗi trong từ điển (O(N) - N nhỏ nên rất nhanh)
+    // [HÀM 1] Lấy ID của chuỗi
     static uint8_t getTokenId(const char* str) {
         for (uint8_t i = 0; i < DICT_SIZE; i++) {
             if (strcmp(DICTIONARY[i], str) == 0) return i;
@@ -96,48 +75,61 @@ public:
         return 0xFF; // Không tìm thấy
     }
 
-    // Lấy chuỗi từ ID (O(1))
+    // [HÀM 2] Lấy chuỗi từ ID
     static const char* getString(uint8_t id) {
         if (id < DICT_SIZE) return DICTIONARY[id];
         return "unknown";
     }
 
-    // --- ENCODER: JSON -> BINARY ---
-    // Nén JsonDocument thành mảng byte để gửi LoRa
+    // [HÀM 3] TÍNH CRC-16 (Modbus Poly 0xA001) - Dùng cho UART
+    static uint16_t calculateCRC(const uint8_t *data, size_t len) {
+        uint16_t crc = 0xFFFF;
+        for (size_t i = 0; i < len; i++) {
+            crc ^= data[i];
+            for (int j = 0; j < 8; j++) {
+                if (crc & 1) crc = (crc >> 1) ^ 0xA001;
+                else crc >>= 1;
+            }
+        }
+        return crc;
+    }
+
+    // [HÀM 4] KIỂM TRA CRC GÓI TIN NHẬN ĐƯỢC
+    static bool checkCRC(const uint8_t *data, size_t totalLen) {
+        if (totalLen < 3) return false;
+        size_t payloadLen = totalLen - 2;
+        uint16_t calc = calculateCRC(data, payloadLen);
+        // UART gửi Little Endian (Low trước, High sau)
+        uint16_t received = data[payloadLen] | (data[payloadLen+1] << 8);
+        return calc == received;
+    }
+
+    // [HÀM 5] ENCODER: JSON -> BINARY
     static int encodeJsonToBinary(const JsonDocument& doc, uint8_t* buffer, int maxLen) {
         int idx = 0;
         JsonObjectConst root = doc.as<JsonObjectConst>();
 
         for (JsonPairConst kv : root) {
             const char* keyStr = kv.key().c_str();
-            
-            // Bỏ qua các key định danh (vì ID đã nằm ở Header gói tin)
             if (strcmp(keyStr, "device_id") == 0 || strcmp(keyStr, "device") == 0) continue;
 
             uint8_t keyToken = getTokenId(keyStr);
-            if (keyToken == 0xFF) {
-                // Key lạ => Bỏ qua để tiết kiệm (hoặc có thể code thêm để gửi raw)
-                continue; 
-            }
+            if (keyToken == 0xFF) continue; // Key lạ bỏ qua
 
-            if (idx + 10 >= maxLen) break; // Tràn buffer
+            if (idx + 10 >= maxLen) break;
 
             buffer[idx++] = DT_KEY_TOKEN;
             buffer[idx++] = keyToken;
 
             JsonVariantConst val = kv.value();
             
-            // 1. Xử lý chuỗi (String)
             if (val.is<const char*>()) {
                 const char* s = val.as<const char*>();
                 uint8_t valToken = getTokenId(s);
-                
                 if (valToken != 0xFF) {
-                    // Chuỗi có trong từ điển (VD: "slave") -> Nén còn 2 bytes
                     buffer[idx++] = DT_VAL_TOKEN;
                     buffer[idx++] = valToken;
                 } else {
-                    // Chuỗi lạ -> Gửi nguyên bản (Tốn dung lượng nhưng an toàn)
                     int slen = strlen(s);
                     if (idx + 2 + slen < maxLen) {
                         buffer[idx++] = DT_VAL_RAW_STR;
@@ -147,14 +139,10 @@ public:
                     }
                 }
             }
-            // 2. Xử lý số (Float/Int)
             else if (val.is<float>() || val.is<int>()) { 
                  float f = val.as<float>();
-                 
-                 // Kiểm tra xem có phải số nguyên không để nén nhỏ hơn
                  if (f == (int32_t)f) {
                      int32_t i32 = (int32_t)f;
-                     // Nén tối đa: int8 (1 byte), int16 (2 bytes), int32 (4 bytes)
                      if (i32 >= -128 && i32 <= 127) {
                          buffer[idx++] = DT_VAL_INT8;
                          buffer[idx++] = (int8_t)i32;
@@ -167,18 +155,16 @@ public:
                          memcpy(buffer+idx, &i32, 4); idx+=4;
                      }
                  } else {
-                     // Số thực (Float) -> 5 bytes
                      buffer[idx++] = DT_VAL_FLOAT;
                      memcpy(buffer+idx, &f, 4); idx+=4;
                  }
             }
         }
-        buffer[idx++] = DT_END; // Kết thúc gói
+        buffer[idx++] = DT_END;
         return idx;
     }
 
-    // --- DECODER: BINARY -> JSON ---
-    // Giải mã mảng byte LoRa thành JsonDocument
+    // [HÀM 6] DECODER: BINARY -> JSON
     static void decodeBinaryToJson(const uint8_t* buffer, int len, JsonDocument& doc) {
         int idx = 0;
         const char* currentKey = nullptr;
@@ -211,7 +197,6 @@ public:
                     }
                     case DT_VAL_FLOAT: {
                         float v; memcpy(&v, buffer+idx, 4); idx+=4;
-                        // Làm tròn 2 số lẻ cho đẹp (VD: 30.550000 -> 30.55)
                         doc[currentKey] = (float)((int)(v * 100 + 0.5)) / 100.0;
                         break;
                     }
@@ -227,7 +212,7 @@ public:
                         break;
                     }
                 }
-                currentKey = nullptr; // Reset sau khi gán value xong
+                currentKey = nullptr; 
             }
         }
     }
