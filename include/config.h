@@ -29,8 +29,10 @@
 #define LORA_CR         5
 #define LORA_SYNC_WORD  0xF3 
 
-// --- TIMING (SỬA LỖI THIẾU Ở ĐÂY) ---
+// --- TIMING (ĐÃ TỐI ƯU CHO GATEWAY MỚI) ---
 #define POLL_INTERVAL_SEC  10     
-#define POLL_TIMEOUT_MS    2000  
+// Tăng lên 500ms để chắc chắn bắt được gói tin từ Gateway (Gateway delay ~100ms)
+#define POLL_TIMEOUT_MS    500   
+// Chờ xác nhận ngủ lâu hơn chút để an toàn
 #define GW_CONFIRM_MS      3000  
 #define DEEP_SLEEP_BAT_SEC 3600
