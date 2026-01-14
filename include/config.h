@@ -1,6 +1,10 @@
 #pragma once
 #include "KeyConfig.h" 
 
+// --- BRIDGE IDENTITY ---
+#define BRIDGE_DEVICE_ID   "01"   // Unique ID for this Bridge (01, 02, 03, etc.)
+#define NODE_DEVICE_ID     "AIR_VL_01"  // Connected Node identifier
+
 // --- UART & GPIO ---
 #define UART_BAUD       921600
 #define UART_RX_PIN     16 
@@ -10,10 +14,12 @@
 #define PIN_BAT_ADC     34   
 
 // --- POWER ---
-#define VOLT_LOW_LIMIT  3.6  
-#define VOLT_RECOVERY   3.9  
-#define ADAPTER_VOLT    0.5  
-#define BAT_DIVIDER     2.0  
+#define VOLT_LOW_LIMIT  3.6   // Battery low threshold
+#define VOLT_RECOVERY   3.9   // Battery recovery threshold
+#define ADAPTER_VOLT    0.3   // External power detected (battery pins open)
+#define BAT_DIVIDER     2.0   // Voltage divider ratio for ADC
+// Note: When measured voltage < 0.3V, it means battery is not connected
+//       and external power is supplied. Program assumes full charge.
 
 // --- LORA ---
 #define LORA_FREQ       433E6

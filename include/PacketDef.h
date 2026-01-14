@@ -2,155 +2,98 @@
 #include <Arduino.h>
 #include <ArduinoJson.h> 
 
-typedef struct {
-    uint8_t payload[256];
-    size_t length;
-    uint8_t nodeId;
-} LoraQueueMsg;
+// Cấu trúc hàng đợi gửi xuống LoRa
+typedef struct { uint8_t payload[256]; size_t length; uint8_t nodeId; } LoraQueueMsg;
 
-struct PacketHeader {
-    uint8_t nodeId;    
-    uint32_t counter;  
-};
+struct PacketHeader { uint8_t nodeId; uint32_t counter; };
 
-enum DataType : uint8_t {
-    DT_END = 0x00, DT_KEY_TOKEN = 0x01, DT_VAL_TOKEN = 0x02,
-    DT_VAL_INT8 = 0x03, DT_VAL_INT16 = 0x04, DT_VAL_INT32 = 0x05,
-    DT_VAL_FLOAT = 0x06, DT_VAL_RAW_STR = 0x07
-};
+enum DataType : uint8_t { DT_END=0, DT_KEY_TOKEN=1, DT_VAL_TOKEN=2, DT_VAL_INT8=3, DT_VAL_INT16=4, DT_VAL_INT32=5, DT_VAL_FLOAT=6, DT_VAL_RAW_STR=7 };
 
+// [QUAN TRỌNG] Dictionary phải khớp 100% với Bridge
 const char* const DICTIONARY[] = {
     "type", "cmd", "msg", "value", "error", "timestamp", "id",
     "EN", "ack_rec", "batt", "bridge_volt", "poll", "awake", "sleep", "running", "status", "info",
     "set_state", "set_door", "set_fans", "set_time", 
-    "mode", "cycle_manual", "measures_per_day", "device", "device_id",
+    "mode", "cycle_manual", "measures_per_day", "device", "device_id", "target_id", 
     "temp", "hum", "ch4", "co", "nh3", "h2", "alc", "rssi", "node_id", "mics",
     "ack", "data", "manual", "auto", "measure", "stop", 
     "trigger_measure", "stop_measure", "open", "close", "on", "off",
-    "MEASURE_STARTED", "MEASURE_STOPPED", "DOOR_OPENED", "DOOR_CLOSED",
-    "FANS_ON", "FANS_OFF", "CONFIG_OK", "ERR_IN_AUTO", "BUSY", "JSON_ERR",
-    "do_full_measure", "SYSTEM_READY", "time_req",      
-    "dht", "sht", "soil_ss", "bh1750", "pzem", "ds18b20", "slave",
-    "DeFire0", "DeFire1", "DeFire2", "DeFire3", "DeFire4",
-    // --- BỔ SUNG ĐỂ KHỚP VỚI STATEMACHINE MỚI ---
-    "door", "fan", "fans", "state", "WAKEUP_BY_GPIO", "UART_WAKEUP"
+    "MEASURE_STARTED", "MEASURE_DONE", "SLEEP_CONFIRMED",
+    "machine_status", "machine_sync", "time_sync", "time_req", "retry",
+    "door_status", "fan_status", "measuring", "Pin", "Sleep_Mode"
 };
-
-const int DICT_SIZE = sizeof(DICTIONARY) / sizeof(DICTIONARY[0]);
 
 class PacketUtils {
 public:
-    static uint8_t getTokenId(const char* str) {
-        if (!str) return 0xFF;
-        for (uint8_t i = 0; i < DICT_SIZE; i++) if (strcmp(DICTIONARY[i], str) == 0) return i;
-        return 0xFF;
+    static const char* getString(uint8_t token) {
+        if (token < sizeof(DICTIONARY)/sizeof(DICTIONARY[0])) return DICTIONARY[token];
+        return nullptr;
     }
 
-    static const char* getString(uint8_t id) {
-        return (id < DICT_SIZE) ? DICTIONARY[id] : "unknown";
+    static int getToken(const char* str) {
+        for (size_t i = 0; i < sizeof(DICTIONARY)/sizeof(DICTIONARY[0]); i++) {
+            if (strcmp(DICTIONARY[i], str) == 0) return i;
+        }
+        return -1;
     }
 
-    static int encodeJsonToBinary(const JsonDocument& doc, uint8_t* buffer, int maxLen) {
+    // --- ENCODER (JSON -> BINARY) ---
+    static int encodeJsonToBinary(JsonDocument& doc, uint8_t* buffer, int maxLen) {
         int idx = 0;
-        JsonObjectConst root = doc.as<JsonObjectConst>();
-        for (JsonPairConst kv : root) {
-            const char* keyStr = kv.key().c_str();
-            // Bỏ qua ID thiết bị vì đã có trong Header LoRa
-            if (strcmp(keyStr, "device_id") == 0 || strcmp(keyStr, "device") == 0) continue;
-            
-            uint8_t keyToken = getTokenId(keyStr);
-            if (keyToken == 0xFF) continue; 
-            if (idx + 1 >= maxLen) break;
+        JsonObject obj = doc.as<JsonObject>();
+        for (JsonPair p : obj) {
+            // Key
+            int kTok = getToken(p.key().c_str());
+            if (kTok != -1) { buffer[idx++] = DT_KEY_TOKEN; buffer[idx++] = kTok; }
+            else return 0; // Key không có trong từ điển -> Lỗi
 
-            buffer[idx++] = DT_KEY_TOKEN; 
-            buffer[idx++] = keyToken;
-
-            JsonVariantConst val = kv.value();
-            if (val.is<const char*>()) {
-                const char* s = val.as<const char*>();
-                uint8_t valToken = getTokenId(s);
-                if (valToken != 0xFF) { 
-                    if (idx + 2 > maxLen) break;
-                    buffer[idx++] = DT_VAL_TOKEN; 
-                    buffer[idx++] = valToken; 
-                } else {
-                    int slen = strlen(s);
-                    if (idx + 2 + slen < maxLen) {
-                        buffer[idx++] = DT_VAL_RAW_STR; 
-                        buffer[idx++] = (uint8_t)slen;
-                        memcpy(buffer + idx, s, slen); 
-                        idx += slen;
-                    }
+            // Value
+            if (p.value().is<int>()) {
+                int32_t val = p.value().as<int32_t>();
+                if (val >= -128 && val <= 127) { buffer[idx++] = DT_VAL_INT8; buffer[idx++] = (int8_t)val; }
+                else if (val >= -32768 && val <= 32767) { buffer[idx++] = DT_VAL_INT16; memcpy(buffer+idx, &val, 2); idx+=2; }
+                else { buffer[idx++] = DT_VAL_INT32; memcpy(buffer+idx, &val, 4); idx+=4; }
+            }
+            else if (p.value().is<float>()) {
+                float val = p.value().as<float>();
+                buffer[idx++] = DT_VAL_FLOAT; memcpy(buffer+idx, &val, 4); idx+=4;
+            }
+            else if (p.value().is<const char*>()) {
+                const char* s = p.value().as<const char*>();
+                int vTok = getToken(s);
+                if (vTok != -1) { buffer[idx++] = DT_VAL_TOKEN; buffer[idx++] = vTok; }
+                else { 
+                    buffer[idx++] = DT_VAL_RAW_STR; 
+                    uint8_t l = strlen(s); 
+                    buffer[idx++] = l; memcpy(buffer+idx, s, l); idx+=l; 
                 }
-            } else if (val.is<float>() || val.is<int>()) { 
-                 float f = val.as<float>();
-                 if (f == (int32_t)f) {
-                     int32_t i32 = (int32_t)f;
-                     if (i32 >= -128 && i32 <= 127) { 
-                         buffer[idx++] = DT_VAL_INT8; 
-                         buffer[idx++] = (int8_t)i32; 
-                     } else if (i32 >= -32768 && i32 <= 32767) { 
-                         buffer[idx++] = DT_VAL_INT16; 
-                         int16_t t = (int16_t)i32; 
-                         memcpy(buffer+idx, &t, 2); idx+=2; 
-                     } else { 
-                         buffer[idx++] = DT_VAL_INT32; 
-                         memcpy(buffer+idx, &i32, 4); idx+=4; 
-                     }
-                 } else { 
-                     buffer[idx++] = DT_VAL_FLOAT; 
-                     memcpy(buffer+idx, &f, 4); idx+=4; 
-                 }
             }
         }
-        if (idx < maxLen) buffer[idx++] = DT_END;
-        return idx;
+        buffer[idx++] = DT_END; return idx;
     }
 
-    static void decodeBinaryToJson(const uint8_t* buffer, int len, JsonDocument& doc) {
-        int idx = 0; 
-        const char* currentKey = nullptr;
+    // --- DECODER (BINARY -> JSON) ---
+    static void decodeBinaryToJson(uint8_t* buffer, int len, JsonDocument& doc) {
+        int idx = 0; const char* currentKey = nullptr;
         while (idx < len) {
             uint8_t type = buffer[idx++];
             if (type == DT_END) break;
-            if (type == DT_KEY_TOKEN) {
-                currentKey = getString(buffer[idx++]);
-            } else if (currentKey) {
-                switch (type) {
-                    case DT_VAL_TOKEN: 
-                        doc[currentKey] = getString(buffer[idx++]); 
-                        break;
-                    case DT_VAL_INT8: 
-                        doc[currentKey] = (int8_t)buffer[idx++]; 
-                        break;
-                    case DT_VAL_INT16: { 
-                        int16_t v; memcpy(&v, buffer+idx, 2); idx+=2; 
-                        doc[currentKey] = v; 
-                        break; 
-                    }
-                    case DT_VAL_INT32: { 
-                        int32_t v; memcpy(&v, buffer+idx, 4); idx+=4; 
-                        doc[currentKey] = v; 
-                        break; 
-                    }
-                    case DT_VAL_FLOAT: { 
-                        float v; memcpy(&v, buffer+idx, 4); idx+=4; 
-                        doc[currentKey] = v; // Giữ nguyên giá trị float
-                        break; 
-                    }
-                    case DT_VAL_RAW_STR: { 
-                        uint8_t l = buffer[idx++]; 
-                        if(idx + l <= len){
-                            char t[256];
-                            memcpy(t, buffer + idx, l); 
-                            t[l] = 0; 
-                            doc[currentKey] = String(t); 
-                            idx += l;
-                        } 
-                        break; 
-                    }
-                }
-                currentKey = nullptr; 
+            
+            if (type == DT_KEY_TOKEN) { 
+                currentKey = getString(buffer[idx++]); 
+                continue; 
+            }
+            if (!currentKey) continue; 
+
+            if (type == DT_VAL_TOKEN) doc[currentKey] = getString(buffer[idx++]);
+            else if (type == DT_VAL_INT8) doc[currentKey] = (int8_t)buffer[idx++];
+            else if (type == DT_VAL_INT16) { int16_t v; memcpy(&v, buffer+idx, 2); idx+=2; doc[currentKey] = v; }
+            else if (type == DT_VAL_INT32) { int32_t v; memcpy(&v, buffer+idx, 4); idx+=4; doc[currentKey] = v; }
+            else if (type == DT_VAL_FLOAT) { float v; memcpy(&v, buffer+idx, 4); idx+=4; doc[currentKey] = v; }
+            else if (type == DT_VAL_RAW_STR) { 
+                uint8_t l = buffer[idx++]; 
+                char s[256]; memcpy(s, buffer+idx, l); s[l] = 0; 
+                doc[currentKey] = s; idx+=l; 
             }
         }
     }

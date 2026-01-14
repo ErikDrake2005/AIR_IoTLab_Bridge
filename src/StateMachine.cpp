@@ -1,358 +1,523 @@
 #include "StateMachine.h"
-#include "CRC32.h" // [BẮT BUỘC] Tính CRC32 cho UART
+#include "CRC32.h"
+#include "PacketDef.h"
 
-HardwareSerial nodeSerial(1);
+// Timing constants (ms)
+#define T_BATTERY_CHECK    30000   // Check battery every 30s
+#define VOLTAGE_THRESHOLD   3.6    // Voltage threshold (V)
+
+HardwareSerial ns(1);
+
+String getStateName(BridgeState s) {
+    switch(s) {
+        case ST_BOOT:              return "ST_BOOT";
+        case ST_NORMAL:            return "ST_NORMAL (Always-On)";
+        default: return "UNKNOWN";
+    }
+}
 
 StateMachine::StateMachine() {
     _state = ST_BOOT;
-    _uart = &nodeSerial;
-    _lastKnownTimestamp = "0";
-    _pollSent = false;
+    _uart = &ns;
+    _nodeState = NodeState();
+    _nodeState.device_ID = MY_DEVICE_NAME;
+    _lastHeartbeat = 0;
 }
 
 void StateMachine::begin() {
     _pwr.begin();
-    
-    // Config GPIO
-    pinMode(PIN_NODE_STATUS, INPUT);
     pinMode(PIN_NODE_TRIGGER, OUTPUT); 
     digitalWrite(PIN_NODE_TRIGGER, LOW);
+    pinMode(PIN_NODE_STATUS, INPUT);
 
-    // [UART] Config chuẩn cho JSON Text
+    // UART 921600, Buffer lớn
     _uart->begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
-    _uart->setRxBufferSize(2048); 
-    _uart->setTimeout(10); 
+    _uart->setRxBufferSize(4096);
+    _uart->setTimeout(10);
 
-    // [LORA] Config chuẩn
     SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_CS_PIN);
     LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
     
-    if (!LoRa.begin(LORA_FREQ)) { 
-        Serial.println("[ERR] LoRa Init Fail!"); 
-        while(1); 
+    // ✅ FIX: Don't hang on LoRa init failure - allow recovery
+    int loraRetries = 3;
+    while (loraRetries-- > 0) {
+        if (LoRa.begin(LORA_FREQ)) {
+            Serial.println("[LORA] Initialized successfully");
+            break;
+        }
+        Serial.printf("[WARN] LoRa init failed, retries left: %d\n", loraRetries);
+        delay(500);
     }
     
-    LoRa.setSyncWord(LORA_SYNC_WORD); 
+    if (loraRetries <= 0) {
+        Serial.println("[ERR] LoRa failed after 3 retries - continuing anyway");
+        delay(2000);  // Brief delay before continuing
+    }
+    
     LoRa.setSpreadingFactor(LORA_SF);
-    LoRa.setTxPower(LORA_TX_POWER); 
+    LoRa.setSignalBandwidth(LORA_BW);
+    LoRa.setCodingRate4(LORA_CR);
+    LoRa.setSyncWord(LORA_SYNC_WORD);
     LoRa.enableCrc();
-    
-    // Mặc định luôn ở chế độ nhận
-    LoRa.receive();
+    LoRa.setTxPower(LORA_TX_POWER);
+    LoRa.receive();  // LoRa luôn ở trạng thái nhận 24/7
 
-    Serial.println("=== BRIDGE STARTED (AES-LORA <-> JSON-UART) ===");
-    
-    // LOGIC KHỞI ĐỘNG
-    // Nếu bị đánh thức bởi Timer (hết giờ ngủ)
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-        // Kiểm tra xem Node có đang thức không (qua chân Status)
-        if (digitalRead(PIN_NODE_STATUS) == HIGH) {
-            _switchState(ST_NORMAL);
-        } else {
-            // Node vẫn ngủ -> Vào chế độ Poll để hỏi Gateway
-            _switchState(ST_POLLING);
-            _pollSent = false; // Đặt cờ để gửi Poll trong vòng lặp
-        }
-    } else {
-        // Khởi động lạnh hoặc Reset nút -> Vào chế độ thường
-        _switchState(ST_NORMAL);
+    _lastHeartbeat = millis();
+    Serial.println("=== BRIDGE STARTED - Always-On Mode (No Sleep) ===");
+    Serial.println("[INFO] Bridge stays on 24/7, LoRa RX listening");
+    Serial.println("[INFO] Node handles deep_sleep via EN:0 command");
+    _setState(ST_NORMAL);
+}
+
+void StateMachine::_setState(BridgeState s) {
+    if (_state != s) {
+        Serial.printf("[STATE] %s -> %s\n", getStateName(_state).c_str(), getStateName(s).c_str());
+        _state = s;
+        _lastHeartbeat = millis();
     }
 }
 
 void StateMachine::loop() {
-    // 1. Luôn ưu tiên xử lý gói tin LoRa đến (Lệnh từ Gateway)
-    _handleLoRaRx();
-    
-    // 2. Xử lý gói tin UART từ Node
-    _handleUartRx();
+    _handleLoRa();    // Always listen LoRa 24/7
+    _handleUart();    // Always receive from Node
+    _checkBatteryPeriodic();
 
-    // 3. Máy trạng thái
     switch (_state) {
-        case ST_POLLING:
-            // Gửi Poll 1 lần duy nhất khi vào trạng thái này
-            if (!_pollSent) {
-                JsonDocument doc; 
-                doc["type"] = "poll"; 
-                doc["id"] = MY_DEVICE_NAME;
-                // Gửi điện áp Bridge để Gateway giám sát
-                doc["bridge_volt"] = _pwr.getVoltage(); 
-                _sendLoRaPacket(doc); 
-                
-                _pollSent = true; 
-                _timerState = millis(); // Bắt đầu đếm timeout
-                
-                // Quan trọng: Chuyển sang nghe ngay để bắt EN:1
-                LoRa.receive(); 
-            }
-            
-            // Nếu chờ quá lâu không thấy Gateway trả lời -> Ngủ tiếp
-            if (millis() - _timerState > POLL_TIMEOUT_MS) {
-                Serial.println("[POLL] Timeout. No Gateway. Sleep.");
-                _switchState(ST_DEEP_SLEEP);
-            }
-            break;
-
         case ST_NORMAL:
-            // Kiểm tra pin yếu định kỳ (10s/lần)
-            if (millis() - _timerState > 10000) {
-                if (_pwr.isBatteryLow()) _switchState(ST_LOW_BAT_WAIT_OFF);
-                _timerState = millis();
+            // Bridge always on, acts as transparent gateway
+            // - MQTT commands via LoRa → Forward to Node via UART (EN commands)
+            // - Node data via UART → Forward to Gateway via LoRa
+            // - If battery low: Send EN:0 to Node (Node handles deep_sleep)
+            if (_pwr.isBatteryLow()) {
+                Serial.println("[PWR] Low Battery -> Send EN:0 to Node for deep_sleep");
+                JsonDocument doc;
+                doc["device_ID"] = MY_DEVICE_NAME;
+                doc["EN"] = 0;
+                doc["type"] = "command";
+                _sendUart(doc);  // Node will handle EN:0 -> esp_deep_sleep_start()
             }
             break;
 
-        case ST_WAKE_PULSE_HIGH:
-            // Giữ chân Trigger mức cao trong 200ms để đánh thức Node
-            if (millis() - _timerState > 200) {
-                digitalWrite(PIN_NODE_TRIGGER, LOW);
-                _switchState(ST_WAKE_WAIT_GPIO);
-            }
+        case ST_BOOT:
+            _setState(ST_NORMAL);
             break;
 
-        case ST_WAKE_WAIT_GPIO:
-            // Chờ Node phản hồi bằng cách kéo chân Status lên High
-            if (digitalRead(PIN_NODE_STATUS) == HIGH) _switchState(ST_WAKE_SEND_REPORT);
-            // Timeout 5s nếu Node hỏng không dậy được
-            if (millis() - _timerState > 5000) _switchState(ST_DEEP_SLEEP);
+        default:
             break;
-
-        case ST_WAKE_SEND_REPORT: {
-            // Báo cáo Gateway là "Tôi đã dậy rồi"
-            JsonDocument doc; 
-            doc["type"]="info"; doc["status"]="awake"; doc["id"]=MY_DEVICE_NAME;
-            _sendLoRaPacket(doc); 
-            _switchState(ST_NORMAL);
-            break;
-        }
-
-        case ST_WAIT_NODE_SLEEP:
-            // Chờ Node tắt chân Status (xác nhận Node đã tắt)
-            if (digitalRead(PIN_NODE_STATUS) == LOW) _switchState(ST_SEND_ACK_SLEEP);
-            // Timeout 10s
-            if (millis() - _timerState > 10000) _switchState(ST_SEND_ACK_SLEEP);
-            break;
-
-        case ST_SEND_ACK_SLEEP: {
-            // Gửi yêu cầu "Xin ngủ" lên Gateway
-            JsonDocument doc; 
-            doc["type"]="ack"; doc["cmd"]="EN:0";
-            doc["id"]=MY_DEVICE_NAME; 
-            _sendLoRaPacket(doc); 
-            _switchState(ST_WAIT_GW_CONFIRM);
-            break;
-        }
-
-        case ST_WAIT_GW_CONFIRM:
-            // Chờ Gateway gửi {"ack_rec": 1}
-            // Nếu quá hạn mà không thấy Gateway rep -> Ngủ đại (Force Sleep)
-            if (millis() - _timerState > GW_CONFIRM_MS) {
-                Serial.println("[SLEEP] GW No Confirm. Force Sleep.");
-                _switchState(ST_DEEP_SLEEP);
-            }
-            break;
-
-        case ST_DEEP_SLEEP:
-            _pwr.sleepForSeconds(POLL_INTERVAL_SEC);
-            break;
-            
-        case ST_LOW_BAT_WAIT_OFF:
-             // Gửi liên tục lệnh tắt xuống Node qua UART
-             if (millis() - _timerState < 1000 && (millis()%200)==0) {
-                 JsonDocument doc; doc["EN"] = 0;
-                 _sendUartWithCRC32(doc); 
-             }
-             // Sau đó báo Gateway là pin yếu rồi ngủ lâu
-             if (digitalRead(PIN_NODE_STATUS) == LOW || (millis() - _timerState > 2000)) {
-                 JsonDocument doc; doc["pin"] = 0; doc["id"] = MY_DEVICE_NAME;
-                 _sendLoRaPacket(doc); 
-                 delay(500);
-                 _pwr.sleepForSeconds(DEEP_SLEEP_BAT_SEC);
-             }
-             break;
-         default: break;
     }
 }
 
-// =============================================================================
-// LORA HANDLER: AES + BINARY + PACKETDEF
-// =============================================================================
-
-void StateMachine::_handleLoRaRx() {
-    int packetSize = LoRa.parsePacket();
-    if (!packetSize) return;
-
-    uint8_t buf[256]; 
-    int idx = 0;
-    while (LoRa.available() && idx < 256) buf[idx++] = LoRa.read();
+// --- DEVICE_ID FILTERING ---
+bool StateMachine::_isCommandForMe(const JsonDocument& doc) {
+    // Check if command has device_ID field
+    if (doc["device_ID"].isNull()) {
+        // No device_ID specified - accept it (legacy support)
+        Serial.println("[CMD] No device_ID in command (legacy) - accepting");
+        return true;
+    }
     
-    // Kiểm tra ID: Byte đầu tiên phải khớp ID của Bridge này
-    if (buf[0] != MY_NODE_INDEX) {
-        LoRa.receive(); // Không phải của mình, nghe tiếp
+    // Extract device_ID from command
+    String cmdDeviceId = doc["device_ID"].is<String>() ? doc["device_ID"].as<String>() : "";
+    
+    Serial.printf("[CMD] Checking device_ID: command=%s, mine=%s\n", cmdDeviceId.c_str(), BRIDGE_DEVICE_ID);
+    
+    // Check if it matches this Bridge's device_ID
+    if (cmdDeviceId == BRIDGE_DEVICE_ID) {
+        Serial.printf("[CMD] ✓ MATCH! Command for me: device_ID=%s\n", cmdDeviceId.c_str());
+        return true;
+    }
+    
+    // Command is for another Bridge - ignore it
+    Serial.printf("[CMD] ✗ MISMATCH! Command for other Bridge: cmd=%s vs mine=%s - IGNORING\n", 
+                  cmdDeviceId.c_str(), BRIDGE_DEVICE_ID);
+    return false;
+}
+
+void StateMachine::_addDeviceIdToResponse(JsonDocument& doc) {
+    // Add this Bridge's device_ID to all responses
+    if (doc["device_ID"].isNull()) {
+        doc["device_ID"] = BRIDGE_DEVICE_ID;
+    }
+}
+
+void StateMachine::_handleLoRa() {
+    int size = LoRa.parsePacket();
+    if (!size) return;
+    
+    Serial.printf("[LORA] Packet received: %d bytes\n", size);
+
+    uint8_t buf[256];
+    int len = 0;
+    while(LoRa.available() && len < 256) {
+        buf[len++] = LoRa.read();
+    }
+    
+    Serial.printf("[LORA] Read: %d bytes from FIFO\n", len);
+
+    PacketHeader h;
+    uint8_t decrypted[256];
+    int dLen = Security::decryptBinary(buf, len, h, decrypted, MY_AES_KEY);
+    if (dLen < 0) {
+        Serial.printf("[LORA] Decrypt fail (error code: %d)\n", dLen);
+        LoRa.receive();
         return;
     }
 
-    PacketHeader head; 
-    uint8_t decrypted[240];
+    Serial.printf("[LORA] Decrypted: %d bytes\n", dLen);
+
+    JsonDocument doc;
+    PacketUtils::decodeBinaryToJson(decrypted, dLen, doc);
     
-    // 1. Giải mã AES
-    int len = Security::decryptBinary(buf, packetSize, head, decrypted, MY_AES_KEY);
+    const char* cmdType = doc["type"].is<const char*>() ? doc["type"].as<const char*>() : "UNKNOWN";
+    const char* cmdDevId = doc["device_ID"].is<const char*>() ? doc["device_ID"].as<const char*>() : "NONE";
     
-    if (len > 0) {
-        JsonDocument doc; 
-        // 2. Bung nén Binary -> JSON (Dùng PacketUtils)
-        PacketUtils::decodeBinaryToJson(decrypted, len, doc);
+    Serial.printf("[LORA RX] type=%s, device_ID=%s\n", cmdType, cmdDevId);
+    
+    // Log all fields in the received command
+    JsonObject obj = doc.as<JsonObject>();
+    Serial.print("[LORA RX] Fields: ");
+    for (JsonPair p : obj) {
+        Serial.printf("%s ", p.key().c_str());
+    }
+    Serial.println();
+    
+    _procGwCmd(doc);
+    LoRa.receive();  // Quay lại nhận ngay
+}
+
+// Translate Node-RED command format to internal format
+void StateMachine::_translateNodeRedCmd(JsonDocument& doc) {
+    // Command 1: set_state -> type (measure or stop)
+    if (doc["set_state"].is<const char*>()) {
+        const char* state = doc["set_state"];
+        doc["type"] = state;  // "measure" or "stop"
         
-        // 3. Xử lý lệnh
-        _processGatewayCmd(doc);
+        // If measure, rename cycle_manual to cycle
+        if (String(state) == "measure" && doc["cycle_manual"].is<int>()) {
+            doc["cycle"] = doc["cycle_manual"];
+            Serial.printf("[TRANS] set_state:measure cycle_manual=%d -> cycle=%d\n", 
+                         doc["cycle_manual"].as<int>(), doc["cycle"].as<int>());
+        }
+        return;
     }
     
-    // [QUAN TRỌNG] Luôn tái kích hoạt chế độ nhận
-    LoRa.receive(); 
+    // Command 2: set_door -> type
+    if (doc["set_door"].is<const char*>()) {
+        const char* action = doc["set_door"];
+        doc["type"] = "door";
+        doc["action"] = action;  // "open" or "close"
+        Serial.printf("[TRANS] set_door:%s -> type:door action:%s\n", action, action);
+        return;
+    }
+    
+    // Command 3: set_fans -> type
+    if (doc["set_fans"].is<const char*>()) {
+        const char* action = doc["set_fans"];
+        doc["type"] = "fan";
+        doc["action"] = action;  // "on" or "off"
+        Serial.printf("[TRANS] set_fans:%s -> type:fan action:%s\n", action, action);
+        return;
+    }
+    
+    // Command 4: measures_per_day (auto config)
+    if (doc["measures_per_day"].is<int>()) {
+        doc["type"] = "config";
+        int count = doc["measures_per_day"];
+        Serial.printf("[TRANS] measures_per_day:%d -> type:config\n", count);
+        return;
+    }
+    
+    // If no translation needed (EN field, type field already present, etc.)
+    // Just use as-is
 }
 
-void StateMachine::_sendLoRaPacket(JsonDocument& doc) {
-    // 1. Nén JSON -> Binary (Dùng PacketUtils để nén token)
-    // Cách này tốt hơn gửi raw string vì tiết kiệm băng thông
-    uint8_t plain[250];
-    int plainLen = PacketUtils::encodeJsonToBinary(doc, plain, 240);
-
-    // Nếu nén thất bại (dữ liệu rỗng), fallback về raw string
-    if (plainLen == 0) {
-        String jsonStr; serializeJson(doc, jsonStr);
-        plain[0] = DT_VAL_RAW_STR; 
-        plain[1] = jsonStr.length();
-        memcpy(plain + 2, jsonStr.c_str(), jsonStr.length());
-        plain[2 + jsonStr.length()] = DT_END;
-        plainLen = 3 + jsonStr.length();
-        Serial.print("[LORA RAW] "); Serial.println(jsonStr);
-    } 
-
-    // 2. Mã hóa AES
-    PacketHeader head; 
-    head.nodeId = MY_NODE_INDEX; 
-    head.counter = millis(); 
+void StateMachine::_procGwCmd(JsonDocument& doc) {
+    // Always-On Bridge Mode: Transparent gateway - no sleep logic
+    // All commands from Gateway → forward to Node via LoRa
     
-    uint8_t encrypted[256];
-    int sendLen = Security::encryptBinary(head, plain, plainLen, encrypted, MY_AES_KEY);
-
-    // 3. Gửi LoRa
-    // Chuyển LoRa về standby trước khi gửi để an toàn
-    LoRa.idle(); 
-    LoRa.beginPacket(); 
-    LoRa.write(encrypted, sendLen); 
-    LoRa.endPacket(true); // true = Blocking wait (Chờ gửi xong)
+    _translateNodeRedCmd(doc);
     
-    // 4. [QUAN TRỌNG] Chuyển ngay về Receive để chờ phản hồi (nếu có)
-    LoRa.receive();
+    String type = doc["type"].is<String>() ? doc["type"].as<String>() : "";
+    String deviceId = doc["device_ID"].is<String>() ? doc["device_ID"].as<String>() : "";
     
-    Serial.printf("[LORA TX] Sent %d bytes (Encrypted)\n", sendLen);
+    Serial.printf("[GW_CMD] type=%s, device_ID=%s\n", type.c_str(), deviceId.c_str());
+    
+    // TIME_REQ and TIME_RES: Bridge forwards time sync requests/responses to Node
+    if (type == "time_req" || type == "time_res") {
+        Serial.printf("[GW_CMD] %s -> Forward to Node\n", type.c_str());
+        _sendUart(doc);
+        return;
+    }
+    
+    // STATUS_REQ: Bridge responds with current machine status
+    if (type == "status_req") {
+        Serial.println("[GW_CMD] status_req -> Send Bridge status");
+        _sendReport(0);  // Always-on mode, sleep_mode=0
+        return;
+    }
+    
+    // Device ID filtering: Only process commands for this Bridge
+    if (!deviceId.isEmpty() && !_isCommandForMe(doc)) {
+        return;
+    }
+    
+    // All other commands (EN:0, EN:1, door, fan, cycle, etc.) → Forward to Node
+    // Node handles EN:0 → deep_sleep directly via esp_deep_sleep_start()
+    if (!type.isEmpty() && type != "ack_status") {
+        Serial.printf("[GW_CMD] Forward command to Node: %s\n", type.c_str());
+        _sendUart(doc);
+        return;
+    }
 }
 
-// =============================================================================
-// UART HANDLER: JSON TEXT + CRC32
-// =============================================================================
-
-void StateMachine::_handleUartRx() {
+void StateMachine::_handleUart() {
     while (_uart->available()) {
-        // 1. Đọc chuỗi text: {"..."}|CRC_HEX\n
-        String line = _uart->readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0) continue;
-
-        // 2. Tách CRC
-        int separatorIdx = line.lastIndexOf('|');
-        if (separatorIdx == -1) continue; 
-
-        String jsonPart = line.substring(0, separatorIdx);
-        String crcPart = line.substring(separatorIdx + 1);
-
-        // 3. Kiểm tra CRC32
-        unsigned long calcCRC = CRC32::calculate(jsonPart);
-        unsigned long recvCRC = strtoul(crcPart.c_str(), NULL, 16);
-
-        if (calcCRC == recvCRC) {
-            JsonDocument doc;
-            DeserializationError err = deserializeJson(doc, jsonPart);
-            if (!err) {
-                // Lấy Timestamp nếu có
-                if (doc["timestamp"]) _lastKnownTimestamp = doc["timestamp"].as<String>();
-                
-                // Nếu đang ở chế độ Normal -> Forward lên Gateway
-                if (_state == ST_NORMAL) {
-                    // Chèn thêm thông tin pin của Bridge
-                    doc["bridge_volt"] = _pwr.getVoltage();
-                    _sendLoRaPacket(doc); 
-                }
-            }
-        } else {
-            Serial.println("[UART ERR] CRC Mismatch!");
+        String s = _uart->readStringUntil('\n');
+        s.trim();
+        if (s.length() == 0) continue;
+        
+        // Tìm CRC (ngăn cách bằng |)
+        int split = s.lastIndexOf('|');
+        if (split == -1) {
+            // Log từ Node
+            Serial.print("[NODE LOG] ");
+            Serial.println(s);
+            continue;
         }
+        
+        String json = s.substring(0, split);
+        String crcS = s.substring(split + 1);
+        
+        // Kiểm tra CRC
+        uint32_t expectedCrc = strtoul(crcS.c_str(), NULL, 16);
+        uint32_t actualCrc = CRC32::calculate(json);
+        
+        if (actualCrc != expectedCrc) {
+            Serial.printf("[ERR] CRC Fail: %lX vs %lX\n", expectedCrc, actualCrc);
+            continue;
+        }
+
+        JsonDocument doc;
+        if (deserializeJson(doc, json) != DeserializationError::Ok) {
+            Serial.printf("[ERR] JSON parse fail: %s\n", json.c_str());
+            continue;
+        }
+        
+        Serial.printf("[UART RX] type=%s\n", doc["type"].as<const char*>());
+        _procNodeJson(doc);
     }
 }
 
-void StateMachine::_sendUartWithCRC32(JsonDocument& doc) {
-    // 1. Serialize JSON
-    String jsonStr; 
+void StateMachine::_procNodeJson(JsonDocument& doc) {
+    // Always-On Bridge Mode: Simply forward/relay Node data to Gateway
+    String type = doc["type"].as<String>();
+    
+    // Data and time requests: Forward directly to Gateway via LoRa
+    if (type == "data" || type == "time_req") {
+        Serial.printf("[NODE->GW] Forward %s to Gateway\n", type.c_str());
+        
+        if (type == "time_req" && doc["device_ID"].isNull()) {
+            doc["device_ID"] = MY_DEVICE_NAME;
+        }
+        
+        _sendLoRa(doc);
+        return;
+    }
+    
+    // Machine status: Cache Node state and relay to Gateway
+    if (type == "machine_status") {
+        Serial.println("[NODE] Received machine_status - caching and forwarding");
+        
+        // Update local cache of Node state
+        if (!doc["door_status"].isNull()) {
+            _nodeState.door_status = doc["door_status"].as<String>();
+        }
+        if (!doc["fan_status"].isNull()) {
+            _nodeState.fan_status = doc["fan_status"].as<String>();
+        }
+        if (!doc["mode"].isNull()) {
+            _nodeState.mode = doc["mode"].as<String>();
+        }
+        if (!doc["measuring"].isNull()) {
+            _nodeState.measuring = doc["measuring"].as<String>();
+        }
+        if (!doc["timestamp"].isNull()) {
+            _nodeState.timestamp = doc["timestamp"].as<String>();
+        }
+        
+        // Relay to Gateway
+        _sendReport(0);  // Always-on mode: sleep=0
+        return;
+    }
+    
+    // ACK: Log for debugging (no action needed in always-on mode)
+    if (type == "ack") {
+        Serial.println("[NODE] ACK received");
+        return;
+    }
+}
+
+void StateMachine::_sendReport(bool sleep) {
+    JsonDocument doc;
+    doc["type"] = "machine_status";
+    
+    // Use Node's device_ID (this is Node data being relayed)
+    doc["device_ID"] = _nodeState.device_ID.isEmpty() ? NODE_DEVICE_ID : _nodeState.device_ID;
+    
+    // ALL 9 fields always sent
+    doc["door_status"] = _nodeState.door_status.isEmpty() ? "unknown" : _nodeState.door_status;
+    doc["fan_status"] = _nodeState.fan_status.isEmpty() ? "unknown" : _nodeState.fan_status;
+    doc["mode"] = _nodeState.mode.isEmpty() ? "manual" : _nodeState.mode;
+    doc["measuring"] = _nodeState.measuring.isEmpty() ? "NO" : _nodeState.measuring;
+    doc["timestamp"] = _nodeState.timestamp.isEmpty() ? "0" : _nodeState.timestamp;
+    
+    // Bridge measures Pin voltage
+    float voltage = _pwr.getVoltage();
+    doc["Pin"] = (voltage > 0) ? voltage : 3.6;
+    
+    // Sleep status
+    doc["Sleep_Mode"] = sleep ? 1 : 0;
+    
+    // DEBUG: Log JSON being sent
+    String jsonStr;
     serializeJson(doc, jsonStr);
-
-    // 2. Tính CRC32
-    unsigned long crc = CRC32::calculate(jsonStr);
-
-    // 3. Gửi Text format: JSON|CRC_HEX
-    _uart->print(jsonStr);
-    _uart->print("|");
-    _uart->println(String(crc, HEX));
+    Serial.printf("[SEND] Machine Status from Bridge %s: %s\n", BRIDGE_DEVICE_ID, jsonStr.c_str());
     
-    Serial.print("[UART TX] "); Serial.println(jsonStr);
+    _sendLoRa(doc);
 }
 
-// =============================================================================
-// LOGIC XỬ LÝ LỆNH TỪ GATEWAY
-// =============================================================================
-
-void StateMachine::_processGatewayCmd(JsonDocument& doc) {
-    String type = doc["type"] | "";
+void StateMachine::_sendLoRa(JsonDocument& doc) {
+    // Thêm device_ID nếu chưa có
+    if (doc["device_ID"].isNull()) {
+        doc["device_ID"] = MY_DEVICE_NAME;
+    }
     
-    // Trường hợp 1: Đang Poll (Ngủ dậy hỏi Gateway)
-    if (_state == ST_POLLING) {
-        // Gateway trả lời {"EN": 1} -> Đánh thức Node
-        if (doc["EN"] == 1) { 
-            Serial.println("[CMD] Gateway says WAKEUP!");
-            digitalWrite(PIN_NODE_TRIGGER, HIGH);
-            _switchState(ST_WAKE_PULSE_HIGH);
+    // Encode JSON -> Binary
+    uint8_t buf[256];
+    int len = PacketUtils::encodeJsonToBinary(doc, buf, 256);
+    if (len <= 0) {
+        // ✅ FALLBACK: Send as plain JSON with CRC (same as _sendUart)
+        // Use static buffer to avoid stack overflow
+        static char jsonBuf[512];
+        serializeJson(doc, jsonBuf, sizeof(jsonBuf));
+        
+        uint32_t crc = CRC32::calculate(jsonBuf);
+        
+        // Send: #<json>|<crc>
+        LoRa.beginPacket();
+        LoRa.write((uint8_t)'#');  // JSON marker
+        LoRa.write((uint8_t*)jsonBuf, strlen(jsonBuf));
+        LoRa.write((uint8_t)'|');
+        
+        // Write CRC as hex string
+        char crcStr[10];
+        snprintf(crcStr, sizeof(crcStr), "%lX", crc);
+        LoRa.write((uint8_t*)crcStr, strlen(crcStr));
+        
+        LoRa.endPacket();
+        
+        Serial.printf("[LORA TX JSON] #%s|%s\n", jsonBuf, crcStr);
+        LoRa.receive();
+        return;
+    }
+    
+    // Tạo header và mã hóa
+    PacketHeader h;
+    h.nodeId = MY_NODE_INDEX;
+    h.counter = millis();
+    
+    uint8_t enc[256];
+    int eLen = Security::encryptBinary(h, buf, len, enc, MY_AES_KEY);
+    if (eLen <= 0) {
+        Serial.println("[ERR] Encrypt failed");
+        LoRa.receive();
+        return;
+    }
+    
+    // Gửi qua LoRa
+    LoRa.beginPacket();
+    LoRa.write(enc, eLen);
+    LoRa.endPacket();
+    
+    Serial.printf("[LORA TX BIN] %d bytes sent\n", eLen);
+    
+    // Quay lại chế độ nhận
+    LoRa.receive();
+}
+
+void StateMachine::_sendUart(JsonDocument& doc) {
+    // Use binary encoding for efficiency (PacketDef)
+    uint8_t buf[256];
+    int len = PacketUtils::encodeJsonToBinary(doc, buf, 256);
+    
+    if (len <= 0) {
+        // Fallback to JSON if binary encoding fails
+        String s;
+        serializeJson(doc, s);
+        uint32_t crc = CRC32::calculate(s);
+        _uart->printf("%s|%lX\n", s.c_str(), crc);
+        Serial.printf("[UART TX JSON] %s|%lX\n", s.c_str(), crc);
+        return;
+    }
+    
+    // Send binary format
+    _uart->write(buf, len);
+    _uart->write('\n');  // Terminator
+    
+    String jsonStr;
+    serializeJson(doc, jsonStr);
+    Serial.printf("[UART TX BIN] %d bytes: %s\n", len, jsonStr.c_str());
+}
+
+void StateMachine::_checkBatteryPeriodic() {
+    static unsigned long lastCheck = 0;
+    static bool noBatteryWarning = false;
+    
+    if (millis() - lastCheck > T_BATTERY_CHECK) {
+        lastCheck = millis();
+        
+        float voltage = _pwr.getVoltage();
+        
+        // No battery connected (voltage = 0)
+        if (voltage <= 0) {
+            if (!noBatteryWarning) {
+                Serial.println("[PWR] No battery detected - running on external power only");
+                noBatteryWarning = true;
+            }
+            return;  // Silent mode - don't check further without battery
+        }
+        
+        noBatteryWarning = false;  // Reset flag
+        
+        // Detect power source
+        if (_pwr.isAdapterConnected()) {
+            // Battery not connected, using external power (adapter)
+            Serial.printf("[PWR] External power detected (V=%.2fV < 0.3V)\n", voltage);
+            Serial.println("[PWR] Running on adapter power - battery assumed fully charged");
         } else {
-            // Nhận rác hoặc không có lệnh -> Ngủ tiếp
-            _switchState(ST_DEEP_SLEEP);
-        }
-        return;
-    }
-
-    // Trường hợp 2: Đang chờ xác nhận ngủ
-    if (_state == ST_WAIT_GW_CONFIRM) {
-        // Gateway trả lời {"ack_rec": 1} -> Cho phép ngủ
-        if (doc["ack_rec"] == 1) {
-            Serial.println("[CMD] Gateway confirmed Sleep.");
-            _switchState(ST_DEEP_SLEEP);
-        }
-        return;
-    }
-
-    // Trường hợp 3: Đang hoạt động bình thường (Forwarding)
-    if (_state == ST_NORMAL) {
-        // Lệnh cưỡng chế ngủ từ Gateway {"EN": 0}
-        if (doc["EN"] == 0) {
-            JsonDocument stopDoc; stopDoc["EN"] = 0;
-            _sendUartWithCRC32(stopDoc); 
-            _switchState(ST_WAIT_NODE_SLEEP);
-        } 
-        else {
-            // Các lệnh khác (Mở cửa, Bật quạt...) -> Chuyển xuống Node
-            _sendUartWithCRC32(doc); 
+            // Battery connected
+            Serial.printf("[PWR] Battery voltage: %.2fV\n", voltage);
+            
+            // Always-On Mode: If battery critically low, send EN:0 to Node for deep_sleep
+            // Bridge itself stays on - Node handles its own deep_sleep
+            if (voltage < VOLTAGE_THRESHOLD) {
+                Serial.printf("[PWR] CRITICAL - Battery %.2fV < %.1fV threshold\n", voltage, VOLTAGE_THRESHOLD);
+                Serial.println("[PWR] Sending EN:0 to Node for deep_sleep");
+                JsonDocument doc;
+                doc["device_ID"] = MY_DEVICE_NAME;
+                doc["EN"] = 0;
+                doc["type"] = "command";
+                _sendUart(doc);  // Node handles EN:0 → esp_deep_sleep_start()
+            }
         }
     }
 }
 
-void StateMachine::_switchState(BridgeState newState) {
-    _state = newState; 
-    _timerState = millis();
-    Serial.printf("[STATE] -> %d\n", newState);
+void StateMachine::_wakeNodeWithPulse() {
+    // Phát pulse qua PIN_NODE_TRIGGER
+    digitalWrite(PIN_NODE_TRIGGER, HIGH);
+    delay(50);
+    digitalWrite(PIN_NODE_TRIGGER, LOW);
+    delay(200);
+    Serial.println("[PULSE] Wake pulse sent to Node");
 }
