@@ -5,64 +5,48 @@
 
 class Security {
 public:
-    // --- MÃ HÓA (ENCRYPT) ---
-    // Output: [Byte 0: NodeID] + [Byte 1..N: Encrypted Data]
+    // Encrypt: [NodeID] + [AES(Counter + Data)]
     static int encryptBinary(PacketHeader header, void* dataPtr, size_t dataLen, uint8_t *outputBuffer, const char* key) {
-        mbedtls_aes_context aes;
-        mbedtls_aes_init(&aes);
+        mbedtls_aes_context aes; mbedtls_aes_init(&aes);
         mbedtls_aes_setkey_enc(&aes, (const unsigned char*) key, 128);
 
-        // 1. Ghi NodeID (Cleartext) vào đầu gói tin
-        outputBuffer[0] = header.nodeId;
-
-        // 2. Chuẩn bị dữ liệu cần mã hóa (Gồm Counter + Payload)
+        outputBuffer[0] = header.nodeId; // Byte 0: ID
+        
         size_t rawLen = sizeof(uint32_t) + dataLen;
         size_t paddedLen = (rawLen % 16 == 0) ? rawLen : ((rawLen / 16) + 1) * 16;
-        
-        uint8_t tempInput[paddedLen];
-        memset(tempInput, 0, paddedLen); // Fill 0 padding
+        uint8_t tempInput[paddedLen]; memset(tempInput, 0, paddedLen);
 
-        // Đóng gói: [Counter] + [Payload]
-        memcpy(tempInput, &header.counter, sizeof(uint32_t));
-        if (dataPtr != nullptr && dataLen > 0) {
-            memcpy(tempInput + sizeof(uint32_t), dataPtr, dataLen);
-        }
+        memcpy(tempInput, &header.counter, 4); // 4 byte đầu là Counter
+        if (dataPtr && dataLen > 0) memcpy(tempInput + 4, dataPtr, dataLen);
 
-        // 3. Mã hóa và ghi vào buffer từ vị trí số 1 trở đi
-        for (int i = 0; i < paddedLen; i += 16) {
+        for (int i = 0; i < paddedLen; i += 16) 
             mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, tempInput + i, outputBuffer + 1 + i);
-        }
         
         mbedtls_aes_free(&aes);
-        return 1 + paddedLen; // Trả về độ dài tổng (1 byte ID + Encrypted part)
+        return 1 + paddedLen;
     }
 
-    // --- GIẢI MÃ (DECRYPT) ---
+    // Decrypt: Tách Counter ra, trả về độ dài Data thực
     static int decryptBinary(uint8_t *inputBuffer, int len, PacketHeader &header, uint8_t *outputPayload, const char* key) {
-        if (len < 17) return -1; // Tối thiểu 1 byte ID + 16 byte block
+        if (len < 17) return -1;
         int encryptedLen = len - 1;
-        if (encryptedLen % 16 != 0) return -1;
-
-        // 1. Lấy NodeID (để tham khảo)
+        
         header.nodeId = inputBuffer[0];
-
-        mbedtls_aes_context aes;
-        mbedtls_aes_init(&aes);
+        mbedtls_aes_context aes; mbedtls_aes_init(&aes);
         mbedtls_aes_setkey_dec(&aes, (const unsigned char*) key, 128);
 
-        uint8_t plainBuffer[encryptedLen];
+        uint8_t tempDecrypted[encryptedLen];
+        for (int i = 0; i < encryptedLen; i += 16) 
+            mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, inputBuffer + 1 + i, tempDecrypted + i);
         
-        // 2. Giải mã phần thân (Bỏ qua byte đầu tiên)
-        for (int i = 0; i < encryptedLen; i += 16) {
-            mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, inputBuffer + 1 + i, plainBuffer + i);
-        }
         mbedtls_aes_free(&aes);
 
-        // 3. Tách Counter và Payload
-        memcpy(&header.counter, plainBuffer, sizeof(uint32_t));
-        int payloadLen = encryptedLen - sizeof(uint32_t);
-        memcpy(outputPayload, plainBuffer + sizeof(uint32_t), payloadLen);
-
-        return payloadLen;
+        memcpy(&header.counter, tempDecrypted, 4); // Lấy Counter
+        int dataLen = encryptedLen - 4; // Trừ 4 byte Counter ra
+        
+        // Copy phần còn lại vào outputPayload (Data sạch cho JSON decode)
+        if (dataLen > 0) memcpy(outputPayload, tempDecrypted + 4, dataLen);
+        
+        return dataLen;
     }
 };
