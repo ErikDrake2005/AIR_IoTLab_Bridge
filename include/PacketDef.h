@@ -2,30 +2,51 @@
 #include <Arduino.h>
 #include <ArduinoJson.h> 
 
-// Cấu trúc hàng đợi gửi xuống LoRa
-typedef struct { uint8_t payload[512]; size_t length; uint8_t nodeId; } LoraQueueMsg;
-
-// Header gói tin LoRa (5 bytes)
+// Header gói tin LoRa (5 bytes): ID + Counter
 struct PacketHeader { uint8_t nodeId; uint32_t counter; };
 
-// Enum định nghĩa kiểu dữ liệu nén
+// Enum kiểu dữ liệu nén
 enum DataType : uint8_t { 
     DT_END=0, DT_KEY_TOKEN=1, DT_VAL_TOKEN=2, DT_VAL_INT8=3, DT_VAL_INT16=4, 
     DT_VAL_INT32=5, DT_VAL_FLOAT=6, DT_VAL_RAW_STR=7, DT_OBJ_START=8, DT_OBJ_END=9, DT_NULL=10        
 };
 
-// [TỪ ĐIỂN] PHẢI GIỐNG HỆT BRIDGE VÀ NODE
+// [TỪ ĐIỂN] PHẢI ĐỒNG BỘ 100% VỚI BRIDGE VÀ NODE
 const char* const DICTIONARY[] = {
+    // Basic Keys
     "type", "NID", "en", "req", "set", "cmd", "do", "content", "node", "id",
     "device_ID", "device", "target_id", "node_id", "timestamp", "pin", "rssi", "batt", "bridge_volt", "Pin",
+    
+    // Values & Status
     "AUTO", "MANUAL", "TIMESTAMP", "SLEEP", "ack", "error", "msg", "value", "info", "status",
     "awake", "sleep", "running", "poll", "connected", "disconnected", "open", "close", "on", "off",
-    "start", "stop", "trigger_measure", "stop_measure", "set_state", "set_door", "set_fans", "WakeUp", "MEASURE_STARTED", "ack_rec",
+    "start", "stop", "trigger_measure", "stop_measure", "set_state", "set_door", "set_fans", 
+    "WakeUp", "MEASURE_STARTED", "ack_rec",
+    
+    // Sensors
     "temp", "hum", "ch4", "co", "nh3", "h2", "alc", "c2h5oh", "measuring", "measure_status",
-    "transmissionIntervalMinutes", "measurementCount", "startTime", "cycle_manual", "measures_per_day", "schedules",
-    "chamberStatus", "doorStatus", "fanStatus", "saved_manual_cycle", "saved_daily_meansure", "Sleep_Mode", "machine_status",
-    "time_req", "time_res", "data", "gw_rssi", "gw_snr",
-    NULL 
+    
+    // NEW KEYS (V2 PROTOCOL)
+    "transmissionIntervalMinutes", 
+    "measurementCount", 
+    "startTime", 
+    "cycle_manual", 
+    "measures_per_day", 
+    "schedules",
+    "chamberStatus", 
+    "doorStatus", 
+    "fanStatus", 
+    "saved_manual_cycle", 
+    "saved_daily_meansure", 
+    "Sleep_Mode", 
+    "machine_status",
+    "time_req", 
+    "time_res", 
+    "data", 
+    "gw_rssi", 
+    "gw_snr",
+    
+    NULL // Kết thúc
 };
 
 class PacketUtils {
@@ -35,14 +56,14 @@ public:
         if (token >= count) return nullptr;
         return DICTIONARY[token];
     }
-    // Encoder (JSON -> Binary)
+    // Encode JSON -> Binary (Hỗ trợ Nested Object)
     static int encodeJsonToBinary(JsonDocument& doc, uint8_t* buffer, int maxLen) {
         int idx = 0;
         JsonObject root = doc.as<JsonObject>();
         serializeObject(root, buffer, idx, maxLen);
         buffer[idx++] = DT_END; return idx;
     }
-    // Decoder (Binary -> JSON)
+    // Decode Binary -> JSON
     static void decodeBinaryToJson(uint8_t* buffer, int len, JsonDocument& doc) {
         int idx = 0;
         JsonObject root = doc.to<JsonObject>();
@@ -58,9 +79,14 @@ private:
                 if (strcmp(key, DICTIONARY[i]) == 0) { keyToken = i; break; }
             }
             if (keyToken != -1) { buffer[idx++] = DT_KEY_TOKEN; buffer[idx++] = (uint8_t)keyToken; } 
-            else continue; 
+            else continue; // Bỏ qua nếu key không có trong từ điển
+            
             JsonVariant v = kv.value();
-            if (v.is<JsonObject>()) { buffer[idx++] = DT_OBJ_START; serializeObject(v.as<JsonObject>(), buffer, idx, maxLen); buffer[idx++] = DT_OBJ_END; } 
+            if (v.is<JsonObject>()) { 
+                buffer[idx++] = DT_OBJ_START; 
+                serializeObject(v.as<JsonObject>(), buffer, idx, maxLen); 
+                buffer[idx++] = DT_OBJ_END; 
+            } 
             else if (v.isNull()) { buffer[idx++] = DT_NULL; }
             else if (v.is<int>()) {
                 int32_t val = v.as<int32_t>();

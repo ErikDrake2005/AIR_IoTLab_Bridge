@@ -46,13 +46,13 @@ void StateMachine::_handleLoRa() {
     if (packetSize) {
         Serial.printf("[LORA RX] Size: %d, RSSI: %d\n", packetSize, LoRa.packetRssi());
         
-        uint8_t buf[256];
+        uint8_t buf[512]; // Tăng buffer lên 512 cho an toàn
         int idx = 0;
-        while (LoRa.available() && idx < 256) buf[idx++] = LoRa.read();
+        while (LoRa.available() && idx < 512) buf[idx++] = LoRa.read();
         
         // A. Giải mã AES
         PacketHeader header;
-        uint8_t decrypted[256];
+        uint8_t decrypted[512];
         int len = Security::decryptBinary(buf, idx, header, decrypted, MY_AES_KEY);
         
         if (len < 0) { Serial.println("[ERR] Decrypt Fail"); return; }
@@ -61,9 +61,8 @@ void StateMachine::_handleLoRa() {
         JsonDocument doc;
         PacketUtils::decodeBinaryToJson(decrypted, len, doc);
         
-        // Debug
-        String dbg; serializeJson(doc, dbg);
-        Serial.println("[LORA->JSON] " + dbg);
+        // Debug (Chỉ bật khi cần thiết để tránh spam)
+        // String dbg; serializeJson(doc, dbg); Serial.println("[LORA->JSON] " + dbg);
 
         // C. Xử lý Logic (Lọc ID, En, Req)
         _processDownlinkJson(doc);
@@ -72,7 +71,6 @@ void StateMachine::_handleLoRa() {
 
 void StateMachine::_processDownlinkJson(JsonDocument& doc) {
     // 1. Lọc ID (NID)
-    // Cấu trúc: {"NID":"...", "en":..., "req":{...}}
     if (doc["NID"].isNull()) return;
     
     String targetID = doc["NID"].as<String>();
@@ -82,26 +80,18 @@ void StateMachine::_processDownlinkJson(JsonDocument& doc) {
     }
 
     // 2. Kiểm tra Enable (en)
-    int en = doc["en"].as<int>(); // 0 hoặc 1
+    int en = doc["en"].as<int>(); 
 
     // TRƯỜNG HỢP 1: Yêu cầu ngủ (en = 0)
     if (en == 0) {
-        // Tự tạo lệnh SLEEP gửi xuống Node
-        // Không cần đánh thức nếu nó đang ngủ, nhưng để chắc chắn lệnh đến được -> Vẫn handshake
-        if (_wakeUpNode()) {
-            // Gửi JSON: {"set":"SLEEP"} (Node sẽ tự hiểu là cmd.enable=false)
-            // Hoặc chuẩn hơn theo protocol: {"en":0, "req":{"set":"SLEEP"}}
-            // Tuy nhiên Node V2 đã xử lý được lớp "req", ta gửi format chuẩn để Node dễ parse
-            
-            JsonDocument sleepDoc;
-            sleepDoc["en"] = 0;
-            sleepDoc["req"]["set"] = "SLEEP";
-            
-            String jsonStr;
-            serializeJson(sleepDoc, jsonStr);
-            _sendUart(jsonStr);
-            Serial.println("[DOWN] Sent SLEEP command to Node");
-        }
+        // Gửi lệnh ngủ trực tiếp, không cần đánh thức
+        JsonDocument sleepDoc;
+        sleepDoc["set"] = "SLEEP";
+        
+        String jsonStr;
+        serializeJson(sleepDoc, jsonStr);
+        _sendUart(jsonStr);
+        Serial.println("[DOWN] Sent SLEEP command to Node");
         return;
     }
 
@@ -110,15 +100,11 @@ void StateMachine::_processDownlinkJson(JsonDocument& doc) {
         JsonObject req = doc["req"];
         if (req.isNull()) return;
 
-        // Đánh thức Node
+        // Đánh thức Node trước khi gửi lệnh
         if (_wakeUpNode()) {
-            // Gửi phần nội dung "req" xuống, bọc lại để Node hiểu
-            // Node mong đợi: {"en":1, "req":{...}} hoặc {"set":...}
-            // Để đơn giản và đúng logic Node parse: Ta gửi nguyên cấu trúc đã nhận (đã giải mã)
-            // Vì Node cũng có logic check "en" và "req".
-            
+            // Chỉ gửi nội dung của "req" xuống Node
             String jsonToSend;
-            serializeJson(doc, jsonToSend); // Gửi nguyên cục {"NID":..., "en":1, "req":...}
+            serializeJson(req, jsonToSend);  // ← Chỉ "req"
             _sendUart(jsonToSend);
             Serial.println("[DOWN] Sent command to Node");
         } else {
@@ -131,14 +117,16 @@ void StateMachine::_processDownlinkJson(JsonDocument& doc) {
 // 2. XỬ LÝ UPLINK (NODE -> BRIDGE -> LORA)
 // =================================================================
 void StateMachine::_handleUart() {
-    while (_uart->available()) {
+    // [FIX WDT] Thay while bằng if để tránh treo nếu nhiễu liên tục
+    if (_uart->available()) {
         String raw = _uart->readStringUntil('\n');
         raw.trim();
-        if (raw.length() == 0) continue;
+        
+        if (raw.length() == 0) return;
         
         // Format: JSON|CRC
         int sep = raw.lastIndexOf('|');
-        if (sep == -1) continue;
+        if (sep == -1) return;
         
         String jsonPart = raw.substring(0, sep);
         String crcPart = raw.substring(sep + 1);
@@ -148,15 +136,18 @@ void StateMachine::_handleUart() {
         uint32_t rec = strtoul(crcPart.c_str(), NULL, 16);
         
         if (cal == rec) {
-            Serial.print("[UART->BRIDGE] "); Serial.println(jsonPart);
+            Serial.print("[UART RX] "); Serial.println(jsonPart);
             
-            // 2. Parse JSON từ Node
             JsonDocument nodeDoc;
             DeserializationError err = deserializeJson(nodeDoc, jsonPart);
             
             if (!err) {
-                // 3. Đóng gói lại theo yêu cầu Uplink mới
+                // ========== WRAP & GỬI LÊN GATEWAY ==========
+                // Tất cả gói tin từ Node (time_req, machine_status, data,...)
+                // đều được wrap và gửi LoRa lên Gateway để xử lý
                 _wrapAndSendUplink(nodeDoc);
+            } else {
+                Serial.println("[ERR] JSON Parse Fail");
             }
         } else {
             Serial.printf("[ERR] CRC Fail. Cal:%lX Rec:%lX\n", cal, rec);
@@ -165,21 +156,18 @@ void StateMachine::_handleUart() {
 }
 
 void StateMachine::_wrapAndSendUplink(JsonDocument& nodeDoc) {
-    // Yêu cầu: #{ "device_ID":..., "pin":..., "node": { ... } }
-    // Lưu ý: Dấu # ở đây là quy ước logic, khi nén Binary ta dùng cấu trúc JSON chuẩn.
-    
     JsonDocument bridgeDoc;
     
     // Thêm thông tin Bridge
-    bridgeDoc["device_ID"] = BRIDGE_DEVICE_ID; // Từ config.h
+    bridgeDoc["device_ID"] = BRIDGE_DEVICE_ID; 
     
     float volt = _pwr.getVoltage();
-    bridgeDoc["pin"] = (volt > 0) ? volt : 3.6; // Giả lập nếu không có pin
+    bridgeDoc["pin"] = (volt > 0) ? volt : 3.6; 
     
     // Nhúng toàn bộ JSON của Node vào key "node"
     bridgeDoc["node"] = nodeDoc;
     
-    // 4. Gửi LoRa (Mã hóa Binary)
+    // Gửi LoRa (tag "#" sẽ được thêm trong _sendLoRa)
     _sendLoRa(bridgeDoc);
 }
 
@@ -189,11 +177,11 @@ void StateMachine::_wrapAndSendUplink(JsonDocument& nodeDoc) {
 
 void StateMachine::_sendLoRa(JsonDocument& doc) {
     // Encode JSON -> Binary
-    uint8_t plainBuf[512]; // Buffer lớn hơn chút cho an toàn
+    uint8_t plainBuf[512]; 
     int plainLen = PacketUtils::encodeJsonToBinary(doc, plainBuf, 512);
     
     if (plainLen <= 0) {
-        Serial.println("[ERR] JSON Encode Failed (Too large?)");
+        Serial.println("[ERR] JSON Encode Failed");
         return;
     }
 
@@ -204,14 +192,13 @@ void StateMachine::_sendLoRa(JsonDocument& doc) {
     
     uint8_t cipherBuf[512];
     int cipherLen = Security::encryptBinary(header, plainBuf, plainLen, cipherBuf, MY_AES_KEY);
-    
-    // Send
     LoRa.beginPacket();
+    LoRa.write('#');  // ← Tag "#" để Gateway biết đó là Uplink từ Node
     LoRa.write(cipherBuf, cipherLen);
     LoRa.endPacket();
     LoRa.receive(); // Quay lại chế độ nhận ngay
     
-    Serial.printf("[LORA TX] Sent %d bytes uplink\n", cipherLen);
+    Serial.printf("[LORA TX] Sent %d bytes uplink with tag '#'\n", cipherLen + 1);
 }
 
 void StateMachine::_sendUart(String jsonString) {
@@ -219,33 +206,59 @@ void StateMachine::_sendUart(String jsonString) {
     _uart->print(jsonString);
     _uart->print("|");
     _uart->println(String(crc, HEX));
+    
+    Serial.printf("[UART TX] %s\n", jsonString.c_str());
 }
 
 bool StateMachine::_wakeUpNode() {
-    // 1. Kiểm tra xem Node có đang thức không? (GPIO 25)
     if (digitalRead(PIN_NODE_STATUS) == HIGH) {
-        return true; // Node đang thức, gửi luôn
+        Serial.println("[WAKE] Node already awake!");
+        return true; 
     }
     
-    Serial.println("[WAKE] Triggering Node...");
+    // Node đang ngủ → cần đánh thức
+    Serial.println("[WAKE] Node sleeping, triggering wakeup...");
     
-    // 2. Kích xung đánh thức (GPIO 26)
+    // Kích GPIO 26 của Bridge vào GPIO 33 của Node
     digitalWrite(PIN_NODE_TRIGGER, HIGH);
-    delay(50); // Giữ 50ms
+    delay(50); 
     digitalWrite(PIN_NODE_TRIGGER, LOW);
     
-    // 3. Chờ Node phản hồi (Timeout 500ms)
+    // Chờ Node phản hồi (GPIO 25 lên HIGH) - Timeout 1 giây
     unsigned long start = millis();
-    while (millis() - start < 500) {
+    unsigned long timeout = 1000;  // 1 giây
+    int attempts = 0;
+    
+    while (millis() - start < timeout) {
         if (digitalRead(PIN_NODE_STATUS) == HIGH) {
-            Serial.println("[WAKE] Node Awake!");
-            delay(50); // Chờ thêm xíu cho Node ổn định UART
+            Serial.println("[WAKE] Node Awake! (GPIO 25 HIGH)");
+            delay(50); // Chờ ổn định
             return true;
         }
-        delay(5);
+        delay(10);
     }
     
-    return false; // Node không phản hồi
+    // Timeout lần 1 → đánh thức lại
+    Serial.println("[WAKE] First timeout, attempting again...");
+    digitalWrite(PIN_NODE_TRIGGER, HIGH);
+    delay(50); 
+    digitalWrite(PIN_NODE_TRIGGER, LOW);
+    
+    // Chờ lần 2 - Timeout 500ms
+    start = millis();
+    timeout = 500;
+    
+    while (millis() - start < timeout) {
+        if (digitalRead(PIN_NODE_STATUS) == HIGH) {
+            Serial.println("[WAKE] Node Awake on retry!");
+            delay(50);
+            return true;
+        }
+        delay(10);
+    }
+    
+    Serial.println("[WAKE] Node failed to wake up!");
+    return false; 
 }
 
 void StateMachine::_tryLoRaInit() {
@@ -257,10 +270,12 @@ void StateMachine::_tryLoRaInit() {
         return;
     }
     
+    // CẤU HÌNH KHỚP VỚI GATEWAY
     LoRa.setTxPower(LORA_TX_POWER);
     LoRa.setSpreadingFactor(LORA_SF);
     LoRa.setSignalBandwidth(LORA_BW);
     LoRa.setCodingRate4(LORA_CR);
+    LoRa.setSyncWord(LORA_SYNC_WORD); // <--- QUAN TRỌNG: 0xF3
     LoRa.enableCrc();
     
     Serial.println("[LORA] Init Success");
