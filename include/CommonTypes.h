@@ -1,86 +1,78 @@
 #pragma once
 #include <Arduino.h>
 
-// --- CÁC ĐỊNH NGHĨA CONSTANT (HẰNG SỐ) ---
-#define MAX_JSON_SIZE 1024  // Kích thước tối đa cho gói tin JSON
+// --- CÁC ĐỊNH NGHĨA CONSTANT ---
+#define MAX_JSON_SIZE 1024 
 
 // --- ENUM: CÁC CHẾ ĐỘ & TRẠNG THÁI ---
-
-// Chế độ hoạt động (Mapping với JSON "set")
 enum SystemMode {
     MODE_MANUAL = 0,
     MODE_AUTO = 1,
-    MODE_TIMESTAMP = 2, // Chế độ chỉ để đồng bộ giờ
+    MODE_TIMESTAMP = 2,
     MODE_SLEEP = 3
 };
 
-// Trạng thái chu trình đo (Cycle States)
-// Đã bổ sung các trạng thái WAIT cho Auto Cycle 3 bước
 enum CycleState {
-    STATE_IDLE,         // Đang nghỉ/chờ
-    STATE_PREPARE,      // Chuẩn bị (đóng cửa, bật quạt)
-    STATE_WAIT_1,       // Chờ đo lần 1 (phút 3)
-    STATE_WAIT_2,       // Chờ đo lần 2 (phút 8)
-    STATE_WAIT_3,       // Chờ đo lần 3 (phút 15)
-    STATE_MANUAL_WAIT,  // Chờ trong chế độ Manual (nếu cần)
-    STATE_FINISH        // Đã đo xong, xử lý kết quả
+    STATE_IDLE,         
+    STATE_PREPARE,      
+    STATE_WAIT_1,       
+    STATE_WAIT_2,       
+    STATE_WAIT_3,       
+    STATE_MANUAL_WAIT,  
+    STATE_FINISH        
 };
 
 // --- STRUCT: GÓI DỮ LIỆU ---
 
-// 1. Trạng thái máy (Dùng để quản lý trạng thái hiện tại của Node)
+// 1. Trạng thái máy
 struct MachineStatus {
-    SystemMode mode;            // AUTO / MANUAL
-    bool isMeasuring;           // Đang đo hay không
-    bool isDoorOpen;            // Trạng thái cửa
-    bool isFanOn;               // Trạng thái quạt
-    
-    // Các thông số đã lưu (Saved Settings)
-    int saved_manual_cycle;     // Chu kỳ lấy mẫu Manual (phút)
-    int saved_daily_measures;   // Số lần đo Auto/ngày
-    
-    // Constructor mặc định
+    SystemMode mode;           
+    bool isMeasuring;
+    bool isDoorOpen;
+    bool isFanOn;
+    int saved_manual_cycle;    
+    int saved_daily_measures;  
+
     MachineStatus() {
         mode = MODE_MANUAL;
         isMeasuring = false;
-        isDoorOpen = true;  
+        isDoorOpen = true;
         isFanOn = false;
         saved_manual_cycle = 1;
         saved_daily_measures = 4;
     }
 };
 
-// 2. Dữ liệu lệnh từ Server (Parsed Command Data)
+// 2. Dữ liệu lệnh từ Server
 struct CommandData {
-    bool isValid;           // Đánh dấu gói tin có hợp lệ không
-    String targetNID;       // NID của gói tin
-    bool enable;            // en: 1 (thức) hoặc 0 (ngủ)
+    bool isValid;           
+    String targetNID;       
+    bool enable;            
     
-    // Phân loại lệnh
-    SystemMode setMode;     // AUTO/MANUAL/TIMESTAMP/SLEEP
-    
-    // Dữ liệu thời gian (cho TIMESTAMP)
+    SystemMode setMode;     
     unsigned long timestamp;
 
-    // Dữ liệu cấu hình (trong "cmd")
-    int manualInterval;     // transmissionIntervalMinutes
-    int autoMeasureCount;   // measurementCount
-    String autoStartTime;   // startTime
+    int manualInterval;     
+    int autoMeasureCount;   
+    String autoStartTime;   
     
-    // Dữ liệu hành động tức thời (trong "do")
-    bool hasActions;        // Có lệnh hành động không?
-    String chamberStatus;   // "stop-measurement" ...
-    String doorStatus;      // "open", "close"
-    String fanStatus;       // "on", "off"
+    bool hasActions;        
+    String chamberStatus;   
+    String doorStatus;      
+    String fanStatus;       
 
-    // Constructor reset
     CommandData() {
         isValid = false;
+        targetNID = "";
         enable = false;
-        hasActions = false;
         setMode = MODE_MANUAL;
         timestamp = 0;
-        manualInterval = -1; 
-        autoMeasureCount = -1;
+        manualInterval = 0;
+        autoMeasureCount = 0;
+        autoStartTime = "";
+        hasActions = false;
+        chamberStatus = "";
+        doorStatus = "";
+        fanStatus = "";
     }
 };
