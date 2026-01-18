@@ -54,6 +54,12 @@ const char* const DICTIONARY[] = {
     "gw_rssi",
     "gw_snr",
     
+    // 78+: MACHINE STATUS KEYS (THIẾU - ĐÃ THÊM)
+    "mode",
+    "door",
+    "fan",
+    "snr",
+    
     NULL // Điểm kết thúc
 };
 

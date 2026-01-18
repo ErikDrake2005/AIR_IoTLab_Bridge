@@ -47,8 +47,8 @@ private:
     void _txLoop();
 
     // Helpers
-    bool _wakeUpNode(); // Kích GPIO 33 và chờ GPIO 32
-    void _sendToNode(String jsonCmd);
+    bool _wakeUpNode();
+    void _sendToNode(const char* jsonCmd);
     void _sendToGateway(JsonDocument& doc);
     
     // Tách chuỗi CRC từ Node: "JSON|CRC" -> Check OK -> Trả về JSON

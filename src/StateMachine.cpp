@@ -85,7 +85,8 @@ void StateMachine::_uartRxLoop() {
 bool StateMachine::_extractJsonFromUart(String raw, String& outJson) {
     int pipeIdx = raw.lastIndexOf('|');
     if (pipeIdx == -1) {
-        Serial.println("[UART-ERR] No CRC separator found");
+        // Có thể là dữ liệu rác từ bootloader, bỏ qua không log lỗi
+        // Serial.println("[UART-DBG] No CRC separator (boot garbage?)");
         return false;
     }
 
@@ -99,7 +100,7 @@ bool StateMachine::_extractJsonFromUart(String raw, String& outJson) {
         outJson = jsonPart;
         return true;
     } else {
-        Serial.printf("[UART-ERR] CRC Mismatch! Calc: %lX, Recv: %lX. RAW: %s\n", calcCRC, recvCRC, raw.c_str());
+        Serial.printf("[UART-ERR] CRC Mismatch! Calc: %lX, Recv: %lX\n", calcCRC, recvCRC);
         return false;
     }
 }
@@ -123,7 +124,7 @@ void StateMachine::_loraRxLoop() {
             _lastRssi = rssi;
             _lastSnr = snr;
 
-            Serial.printf("[LORA-RX] Size: %d bytes | RSSI: %d | SNR: %.2f\n", idx, rssi, snr);
+            Serial.printf("[RX] %d bytes, RSSI:%d SNR:%.1f\n", idx, rssi, snr);
 
             PacketMsg msg;
             msg.source = 1; // Đánh dấu là tin từ Gateway
@@ -142,37 +143,40 @@ void StateMachine::_processLoop() {
         if (xQueueReceive(_processQueue, &msg, portMAX_DELAY) == pdTRUE) {
             
             // --- CASE 1: UPLINK (NODE -> BRIDGE -> GATEWAY) ---
-            if (msg.source == 0) { 
-                Serial.println("[PROC] Processing Uplink from Node...");
+            if (msg.source == 0) {
 
+                // DEBUG: In ra raw JSON từ Node
+                Serial.printf("[UART-RAW] %s\n", (char*)msg.buf);
+
+                // 1. Parse JSON từ Node trước
+                JsonDocument nodeDoc;
+                DeserializationError err = deserializeJson(nodeDoc, (char*)msg.buf);
+                
+                if (err) {
+                    Serial.printf("[PROC-ERR] Parse Node JSON failed: %s\n", err.c_str());
+                    return; // Bỏ qua gói lỗi
+                }
+
+                // 2. Tạo gói tin Uplink
                 JsonDocument doc;
                 doc["device_ID"] = BRIDGE_DEVICE_ID;
                 doc["pin"] = _pwr.getVoltage();
-                
-                // --- THÊM RSSI & SNR ---
                 doc["rssi"] = _lastRssi;
                 doc["snr"] = _lastSnr;
-                // -----------------------
-
-                // [FIX LỖI QUAN TRỌNG]: Dùng deserializeJson thay vì serialized
-                DeserializationError err = deserializeJson(doc["node"], (char*)msg.buf);
                 
-                if (err) {
-                     Serial.println("[PROC-ERR] Parse Node JSON failed, sending as string fallback");
-                     doc["node"] = (char*)msg.buf; // Fallback
-                }
+                // 3. Copy toàn bộ nội dung từ nodeDoc vào doc["node"]
+                doc["node"] = nodeDoc;
                 
-                // Log kiểm tra
-                String debugStr;
-                serializeJson(doc, debugStr);
-                Serial.printf("[LORA-TX] Sending Uplink JSON: %s\n", debugStr.c_str());
-
+                // DEBUG: In ra JSON sau khi build
+                char debugBuf[512];
+                serializeJson(doc, debugBuf, sizeof(debugBuf));
+                Serial.printf("[UPLINK-JSON] %s\n", debugBuf);
+                
                 _sendToGateway(doc);
             }
             
             // --- CASE 2: DOWNLINK (GATEWAY -> BRIDGE -> NODE) ---
-            else if (msg.source == 1) { 
-                Serial.println("[PROC] Processing Downlink from Gateway...");
+            else if (msg.source == 1) {
                 
                 // 1. Giải mã AES
                 PacketHeader header;
@@ -184,42 +188,27 @@ void StateMachine::_processLoop() {
                     JsonDocument doc;
                     PacketUtils::decodeBinaryToJson(decryptedBuf, decLen, doc);
                     
-                    String debugStr;
-                    serializeJson(doc, debugStr);
-                    Serial.printf("[PROC] Decrypted: %s\n", debugStr.c_str());
-
-                    String nid = doc["NID"].as<String>();
+                    const char* nid = doc["NID"] | "";
                     
-                    // 3. Kiểm tra NID
-                    if (nid == BRIDGE_DEVICE_ID || nid == "ALL") {
+                    if (strcmp(nid, BRIDGE_DEVICE_ID) == 0 || strcmp(nid, "ALL") == 0) {
                         int en = doc["en"];
                         
                         // --- EN = 0: YÊU CẦU NGỦ ---
                         if (en == 0) {
-                            // Chỉ gửi lệnh ngủ nếu Node đang thức
                             if (digitalRead(PIN_NODE_STATUS) == HIGH) {
-                                Serial.println("[PROC] Command: SLEEP -> Sending to Node");
                                 _sendToNode("{\"set\":\"SLEEP\"}");
-                            } else {
-                                Serial.println("[PROC] Command: SLEEP -> Node already sleeping");
                             }
                         } 
                         // --- EN = 1: YÊU CẦU THỰC THI ---
                         else if (en == 1) {
-                            Serial.println("[PROC] Command: ACTION (en=1)");
-                            
-                            // Handshake: Đảm bảo Node thức trước khi gửi
                             if (_wakeUpNode()) {
-                                JsonObject reqObj = doc["req"];
-                                String reqStr;
-                                serializeJson(reqObj, reqStr);
-                                _sendToNode(reqStr);
+                                char reqBuf[256];
+                                serializeJson(doc["req"], reqBuf, sizeof(reqBuf));
+                                _sendToNode(reqBuf);
                             } else {
                                 Serial.println("[ERR] Node did not wake up (Handshake Timeout)!");
                             }
                         }
-                    } else {
-                        Serial.printf("[PROC] Ignored (Wrong NID: %s)\n", nid.c_str());
                     }
                 } else {
                     Serial.println("[ERR] Decrypt Failed");
@@ -251,54 +240,37 @@ void StateMachine::_sendToGateway(JsonDocument& doc) {
         LoRa.beginPacket();
         LoRa.write(encryptedBuf, encLen);
         LoRa.endPacket();
+        LoRa.receive();
         xSemaphoreGive(_loraMutex);
-        Serial.printf("[LORA-TX] Sent %d bytes (Encrypted)\n", encLen);
+        Serial.printf("[TX] %d bytes\n", encLen);
     }
 }
 
-// ================= GỬI UART (KÈM CRC CHO NODE) =================
-void StateMachine::_sendToNode(String jsonCmd) {
-    if (jsonCmd.length() == 0) return;
+// ================= GỬI UART =================
+void StateMachine::_sendToNode(const char* jsonCmd) {
+    if (!jsonCmd || jsonCmd[0] == '\0') return;
     
-    // TÍNH CRC
     unsigned long crc = CRC32::calculate(jsonCmd);
-    
-    _uart->print(jsonCmd);
-    _uart->print("|");
-    _uart->println(String(crc, HEX));
-    
-    Serial.printf("[UART-TX] Payload: %s | CRC: %lX\n", jsonCmd.c_str(), crc);
+    _uart->printf("%s|%lX\n", jsonCmd, crc);
 }
 
-// ================= HANDSHAKE (ĐÁNH THỨC NODE) =================
+// ================= HANDSHAKE =================
 bool StateMachine::_wakeUpNode() {
-    // 1. Kiểm tra nhanh nếu Node đã thức
-    if (digitalRead(PIN_NODE_STATUS) == HIGH) {
-        Serial.println("[PWR] Node is active.");
-        return true; 
-    }
+    if (digitalRead(PIN_NODE_STATUS) == HIGH) return true;
     
-    Serial.println("[PWR] Waking Node (Pulse Trigger)...");
-    
-    // 2. Kích xung đánh thức (Pulse)
-    // GPIO PIN_NODE_WAKEUP nối với GPIO ExtWakeup của Node (thường là 33 hoặc 26)
     digitalWrite(PIN_NODE_WAKEUP, HIGH);
-    vTaskDelay(50 / portTICK_PERIOD_MS); // Giữ 50ms
-    digitalWrite(PIN_NODE_WAKEUP, LOW);   // Thả về LOW
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+    digitalWrite(PIN_NODE_WAKEUP, LOW);
     
-    // 3. Vòng lặp chờ phản hồi (Timeout 2s)
     unsigned long start = millis();
-    while (millis() - start < 2000) { 
+    while (millis() - start < 2000) {
         if (digitalRead(PIN_NODE_STATUS) == HIGH) {
-            Serial.println("[PWR] Node awake confirmed!");
-            
-            // Chờ thêm 100ms để UART của Node ổn định hoàn toàn
-            vTaskDelay(100 / portTICK_PERIOD_MS); 
+            vTaskDelay(100 / portTICK_PERIOD_MS);
             return true;
         }
-        vTaskDelay(50 / portTICK_PERIOD_MS); // Check mỗi 50ms
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
     
-    Serial.println("[PWR] Wakeup Timeout!");
-    return false; 
+    Serial.println("[ERR] Wake timeout");
+    return false;
 }
