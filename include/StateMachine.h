@@ -50,6 +50,7 @@ private:
     bool _wakeUpNode();
     void _sendToNode(const char* jsonCmd);
     void _sendToGateway(JsonDocument& doc);
+    void _sendFixedToGateway(uint8_t* data, int len);  // Fixed-Schema packets
     
     // Tách chuỗi CRC từ Node: "JSON|CRC" -> Check OK -> Trả về JSON
     bool _extractJsonFromUart(String raw, String& outJson);

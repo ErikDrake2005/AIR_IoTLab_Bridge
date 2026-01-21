@@ -154,25 +154,47 @@ void StateMachine::_processLoop() {
                 
                 if (err) {
                     Serial.printf("[PROC-ERR] Parse Node JSON failed: %s\n", err.c_str());
-                    return; // Bỏ qua gói lỗi
+                    continue; // Bỏ qua gói lỗi, KHÔNG return
                 }
 
-                // 2. Tạo gói tin Uplink
-                JsonDocument doc;
-                doc["device_ID"] = BRIDGE_DEVICE_ID;
-                doc["pin"] = _pwr.getVoltage();
-                doc["rssi"] = _lastRssi;
-                doc["snr"] = _lastSnr;
+                // 2. Kiểm tra loại gói tin để chọn Fixed-Schema hoặc Legacy
+                const char* nodeType = nodeDoc["type"] | "";
+                uint8_t deviceId = 1; // Bridge ID (có thể config sau)
+                uint16_t pinMv = _pwr.getVoltage();
                 
-                // 3. Copy toàn bộ nội dung từ nodeDoc vào doc["node"]
-                doc["node"] = nodeDoc;
+                uint8_t fixedBuf[64];
+                int fixedLen = 0;
                 
-                // DEBUG: In ra JSON sau khi build
-                char debugBuf[512];
-                serializeJson(doc, debugBuf, sizeof(debugBuf));
-                Serial.printf("[UPLINK-JSON] %s\n", debugBuf);
+                // ═══ FIXED-SCHEMA ENCODING (Tiết kiệm ~70% băng thông) ═══
+                if (strcmp(nodeType, "data") == 0) {
+                    fixedLen = FixedPacket::encodeUplinkData(nodeDoc, deviceId, pinMv, _lastRssi, _lastSnr, fixedBuf);
+                    Serial.printf("[TX-FIXED] DATA %d bytes (was ~80)\n", fixedLen);
+                }
+                else if (strcmp(nodeType, "machine_status") == 0) {
+                    fixedLen = FixedPacket::encodeUplinkStatus(nodeDoc, deviceId, pinMv, _lastRssi, _lastSnr, fixedBuf);
+                    Serial.printf("[TX-FIXED] STATUS %d bytes (was ~60)\n", fixedLen);
+                }
+                else if (strcmp(nodeType, "time_req") == 0) {
+                    fixedLen = FixedPacket::encodeUplinkTimeReq(deviceId, pinMv, _lastRssi, _lastSnr, fixedBuf);
+                    Serial.printf("[TX-FIXED] TIME_REQ %d bytes (was ~30)\n", fixedLen);
+                }
                 
-                _sendToGateway(doc);
+                // Nếu đã encode thành Fixed-Schema → gửi trực tiếp
+                if (fixedLen > 0) {
+                    _sendFixedToGateway(fixedBuf, fixedLen);
+                }
+                // ═══ LEGACY ENCODING (Cho các gói tin khác như WakeUp Ack) ═══
+                else {
+                    JsonDocument doc;
+                    doc["device_ID"] = BRIDGE_DEVICE_ID;
+                    doc["pin"] = pinMv;
+                    doc["rssi"] = _lastRssi;
+                    doc["snr"] = _lastSnr;
+                    doc["node"] = nodeDoc;
+                    
+                    Serial.printf("[TX-LEGACY] %s\n", nodeType);
+                    _sendToGateway(doc);
+                }
             }
             
             // --- CASE 2: DOWNLINK (GATEWAY -> BRIDGE -> NODE) ---
@@ -183,35 +205,57 @@ void StateMachine::_processLoop() {
                 uint8_t decryptedBuf[512];
                 int decLen = Security::decryptBinary(msg.buf, msg.len, header, decryptedBuf, MY_AES_KEY);
                 
-                if (decLen > 0) {
-                    // 2. Parse Binary -> JSON
-                    JsonDocument doc;
-                    PacketUtils::decodeBinaryToJson(decryptedBuf, decLen, doc);
-                    
-                    const char* nid = doc["NID"] | "";
-                    
-                    if (strcmp(nid, BRIDGE_DEVICE_ID) == 0 || strcmp(nid, "ALL") == 0) {
-                        int en = doc["en"];
-                        
-                        // --- EN = 0: YÊU CẦU NGỦ ---
-                        if (en == 0) {
-                            if (digitalRead(PIN_NODE_STATUS) == HIGH) {
-                                _sendToNode("{\"set\":\"SLEEP\"}");
-                            }
-                        } 
-                        // --- EN = 1: YÊU CẦU THỰC THI ---
-                        else if (en == 1) {
+                if (decLen <= 0) {
+                    Serial.println("[ERR] Decrypt Failed");
+                    continue;
+                }
+                
+                // ═══ TRY FIXED-SCHEMA DOWNLINK FIRST ═══
+                if (decLen > 0 && FixedPacket::isFixedDownlink(decryptedBuf[0])) {
+                    // Fixed TIME_SYNC packet
+                    if (decryptedBuf[0] == PKT_DOWNLINK_TIME) {
+                        uint32_t epoch = 0;
+                        if (FixedPacket::decodeDownlinkTime(decryptedBuf, decLen, epoch)) {
+                            Serial.printf("[RX-FIXED] TIME_SYNC epoch=%lu\n", epoch);
+                            
+                            // Forward to Node as JSON (Node expects JSON over UART)
+                            char timeBuf[64];
+                            snprintf(timeBuf, sizeof(timeBuf), "{\"set\":\"TIMESTAMP\",\"cmd\":%lu}", epoch);
+                            
                             if (_wakeUpNode()) {
-                                char reqBuf[256];
-                                serializeJson(doc["req"], reqBuf, sizeof(reqBuf));
-                                _sendToNode(reqBuf);
-                            } else {
-                                Serial.println("[ERR] Node did not wake up (Handshake Timeout)!");
+                                _sendToNode(timeBuf);
                             }
                         }
                     }
-                } else {
-                    Serial.println("[ERR] Decrypt Failed");
+                    continue;
+                }
+                
+                // ═══ LEGACY DICTIONARY DECODING ═══
+                JsonDocument doc;
+                PacketUtils::decodeBinaryToJson(decryptedBuf, decLen, doc);
+                Serial.printf("[RX-LEGACY] %d bytes\n", decLen);
+                
+                const char* nid = doc["NID"] | "";
+                
+                if (strcmp(nid, BRIDGE_DEVICE_ID) == 0 || strcmp(nid, "ALL") == 0) {
+                    int en = doc["en"];
+                    
+                    // --- EN = 0: YÊU CẦU NGỦ ---
+                    if (en == 0) {
+                        if (digitalRead(PIN_NODE_STATUS) == HIGH) {
+                            _sendToNode("{\"set\":\"SLEEP\"}");
+                        }
+                    } 
+                    // --- EN = 1: YÊU CẦU THỰC THI ---
+                    else if (en == 1) {
+                        if (_wakeUpNode()) {
+                            char reqBuf[256];
+                            serializeJson(doc["req"], reqBuf, sizeof(reqBuf));
+                            _sendToNode(reqBuf);
+                        } else {
+                            Serial.println("[ERR] Node did not wake up (Handshake Timeout)!");
+                        }
+                    }
                 }
             }
         }
@@ -242,7 +286,26 @@ void StateMachine::_sendToGateway(JsonDocument& doc) {
         LoRa.endPacket();
         LoRa.receive();
         xSemaphoreGive(_loraMutex);
-        Serial.printf("[TX] %d bytes\n", encLen);
+        Serial.printf("[TX-LEGACY] %d bytes\n", encLen);
+    }
+}
+
+// ================= GỬI LORA FIXED-SCHEMA (ENCRYPTED) =================
+void StateMachine::_sendFixedToGateway(uint8_t* data, int len) {
+    PacketHeader header;
+    header.nodeId = 1;
+    header.counter = millis();
+    
+    uint8_t encryptedBuf[128];
+    int encLen = Security::encryptBinary(header, data, len, encryptedBuf, MY_AES_KEY);
+    
+    if (xSemaphoreTake(_loraMutex, 1000) == pdTRUE) {
+        LoRa.beginPacket();
+        LoRa.write(encryptedBuf, encLen);
+        LoRa.endPacket();
+        LoRa.receive();
+        xSemaphoreGive(_loraMutex);
+        Serial.printf("[TX-FIXED] %d bytes (payload %d)\n", encLen, len);
     }
 }
 
