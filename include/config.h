@@ -30,12 +30,22 @@
 #define LORA_MISO_PIN   19
 #define LORA_MOSI_PIN   23
 
-// ========== POWER & RTOS ==========
-#define PIN_BAT_ADC      35   
-#define BAT_DIVIDER      2.0  
-#define ADAPTER_VOLT     4.0  
-#define VOLT_LOW_LIMIT   3.3  // <-- Bổ sung dòng này
-#define VOLT_RECOVERY    3.6
+// ========== POWER & BATTERY MONITORING ==========
+#define PIN_BAT_ADC           15    // GPIO15 for battery ADC
+#define BAT_DIVIDER           2.0   // Voltage divider ratio (4.2V -> 2.1V)
+#define BAT_MAX_VOLTAGE       2.1   // Max voltage at ADC pin
+#define ADAPTER_DETECT_VOLT   0.5   // Below this = adapter/debug mode (no battery)
+#define VOLT_LOW_LIMIT        3.7   // Enter low-power mode below this
+#define VOLT_RECOVERY         3.9   // Exit low-power mode above this
+#define BAT_CHECK_INTERVAL_MS 60000 // Check battery every 1 minute
+#define LOW_POWER_SLEEP_SEC   900   // 15 minutes deep sleep when low battery
+
+// ========== NODE WAKE/SLEEP CONTROL ==========
+#define NODE_WAKE_RETRY_MAX   3     // Max wake attempts before 15min cooldown
+#define NODE_WAKE_RETRY_MS    5000  // Wait 5s between wake attempts
+#define NODE_WAKE_COOLDOWN_MS 900000 // 15 minutes cooldown after failed wakes
+
+// ========== RTOS ==========
 #define UART_RX_QUEUE_SIZE   20
 #define LORA_RX_QUEUE_SIZE   10
 #define PROCESS_QUEUE_SIZE   20

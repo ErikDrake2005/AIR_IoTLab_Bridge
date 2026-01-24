@@ -4,27 +4,26 @@
 void StateMachine::uartRxTaskFn(void* param) { ((StateMachine*)param)->_uartRxLoop(); }
 void StateMachine::loraRxTaskFn(void* param) { ((StateMachine*)param)->_loraRxLoop(); }
 void StateMachine::processTaskFn(void* param) { ((StateMachine*)param)->_processLoop(); }
+void StateMachine::powerMonitorTaskFn(void* param) { ((StateMachine*)param)->_powerMonitorLoop(); }
 
 StateMachine::StateMachine() {
     _uart = &Serial2; // Bridge kết nối Node qua Serial2
 }
 
 void StateMachine::begin() {
-    Serial.println("\n[BRIDGE] System Init (V2 + RSSI/SNR)...");
+    Serial.println("\n[BRIDGE] System Init (V2 + Power Management)...");
 
     // 1. Setup UART (921600 - Khớp với Node)
     _uart->begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
     _uart->setRxBufferSize(4096); 
     
-    // 2. Setup GPIO Handshake
-    pinMode(PIN_NODE_WAKEUP, OUTPUT);
-    digitalWrite(PIN_NODE_WAKEUP, LOW); 
-    pinMode(PIN_NODE_STATUS, INPUT_PULLDOWN); 
-
-    // 3. Setup LoRa & Power
+    // 2. Setup GPIO Handshake & Power Managers
     _pwr.begin();
+    _nodePwr.begin();  // Initialize Node power management
+    
     _loraMutex = xSemaphoreCreateMutex();
     
+    // 3. Setup LoRa
     SPI.begin(LORA_SCK_PIN, LORA_MISO_PIN, LORA_MOSI_PIN, LORA_CS_PIN);
     LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
     
@@ -45,6 +44,7 @@ void StateMachine::begin() {
     xTaskCreatePinnedToCore(uartRxTaskFn, "U_RX", 4096, this, 2, NULL, 1);
     xTaskCreatePinnedToCore(loraRxTaskFn, "L_RX", 4096, this, 2, NULL, 1);
     xTaskCreatePinnedToCore(processTaskFn,"PROC", 8192, this, 1, NULL, 1);
+    xTaskCreatePinnedToCore(powerMonitorTaskFn, "PWR", 4096, this, 1, NULL, 0);  // Core 0
 }
 
 // ================= UART RX (NHẬN TỪ NODE) =================
@@ -160,22 +160,23 @@ void StateMachine::_processLoop() {
                 // 2. Kiểm tra loại gói tin để chọn Fixed-Schema hoặc Legacy
                 const char* nodeType = nodeDoc["type"] | "";
                 uint8_t deviceId = 1; // Bridge ID (có thể config sau)
-                uint16_t pinMv = _pwr.getVoltage();
+                uint16_t pinMv = (uint16_t)(_pwr.getCachedVoltage() * 1000);
+                bool nodeSleeping = _nodePwr.isNodeSleeping();
                 
                 uint8_t fixedBuf[64];
                 int fixedLen = 0;
                 
                 // ═══ FIXED-SCHEMA ENCODING (Tiết kiệm ~70% băng thông) ═══
                 if (strcmp(nodeType, "data") == 0) {
-                    fixedLen = FixedPacket::encodeUplinkData(nodeDoc, deviceId, pinMv, _lastRssi, _lastSnr, fixedBuf);
+                    fixedLen = FixedPacket::encodeUplinkData(nodeDoc, deviceId, pinMv, nodeSleeping, fixedBuf);
                     Serial.printf("[TX-FIXED] DATA %d bytes (was ~80)\n", fixedLen);
                 }
                 else if (strcmp(nodeType, "machine_status") == 0) {
-                    fixedLen = FixedPacket::encodeUplinkStatus(nodeDoc, deviceId, pinMv, _lastRssi, _lastSnr, fixedBuf);
+                    fixedLen = FixedPacket::encodeUplinkStatus(nodeDoc, deviceId, pinMv, nodeSleeping, fixedBuf);
                     Serial.printf("[TX-FIXED] STATUS %d bytes (was ~60)\n", fixedLen);
                 }
                 else if (strcmp(nodeType, "time_req") == 0) {
-                    fixedLen = FixedPacket::encodeUplinkTimeReq(deviceId, pinMv, _lastRssi, _lastSnr, fixedBuf);
+                    fixedLen = FixedPacket::encodeUplinkTimeReq(deviceId, pinMv, nodeSleeping, fixedBuf);
                     Serial.printf("[TX-FIXED] TIME_REQ %d bytes (was ~30)\n", fixedLen);
                 }
                 
@@ -188,8 +189,7 @@ void StateMachine::_processLoop() {
                     JsonDocument doc;
                     doc["device_ID"] = BRIDGE_DEVICE_ID;
                     doc["pin"] = pinMv;
-                    doc["rssi"] = _lastRssi;
-                    doc["snr"] = _lastSnr;
+                    doc["isSleeping"] = nodeSleeping ? 1 : 0;
                     doc["node"] = nodeDoc;
                     
                     Serial.printf("[TX-LEGACY] %s\n", nodeType);
@@ -223,7 +223,8 @@ void StateMachine::_processLoop() {
                             char timeBuf[64];
                             snprintf(timeBuf, sizeof(timeBuf), "{\"set\":\"TIMESTAMP\",\"cmd\":%lu}", epoch);
                             
-                            if (_wakeUpNode()) {
+                            // Wake Node nếu cần
+                            if (_nodePwr.isNodeAwake() || _nodePwr.wakeUpNode()) {
                                 _sendToNode(timeBuf);
                             }
                         }
@@ -254,21 +255,41 @@ void StateMachine::_processLoop() {
                             Serial.printf("[RX-FIXED] CMD targetId=%d myId=%d en=%d\n", targetId, myId, en);
                             
                             if (targetId == 0 || targetId == myId) {
-                                // EN = 0: Yêu cầu ngủ
+                                // EN = 0: Yêu cầu Node ngủ
                                 if (en == 0) {
                                     Serial.println("[CMD] EN=0 -> Requesting Node to SLEEP");
-                                    if (digitalRead(PIN_NODE_STATUS) == HIGH) {
+                                    if (_nodePwr.isNodeAwake()) {
                                         _sendToNode("{\"set\":\"SLEEP\"}");
+                                        // Đợi Node xác nhận đã ngủ (GPIO LOW)
+                                        vTaskDelay(500 / portTICK_PERIOD_MS);
+                                        _nodePwr.confirmSleep();
+                                        
+                                        // Gửi sleep report lên Gateway
+                                        _sendSleepReport();
+                                    } else {
+                                        Serial.println("[CMD] Node already sleeping");
+                                        _sendSleepReport();
                                     }
                                 }
-                                // EN = 1: Thực thi lệnh
+                                // EN = 1: Thức Node và thực thi lệnh
                                 else {
                                     Serial.printf("[CMD] EN=1 -> Waking Node and sending: %s\n", jsonBuf);
-                                    if (_wakeUpNode()) {
+                                    
+                                    // Reset cooldown nếu có lệnh en=1 mới
+                                    _nodePwr.resetCooldown();
+                                    
+                                    // Lưu lệnh pending
+                                    _nodePwr.setPendingCommand(jsonBuf);
+                                    
+                                    // Wake Node với retry logic (3 lần, 5s apart)
+                                    if (_nodePwr.wakeUpNode()) {
                                         Serial.printf("[TX-NODE] %s\n", jsonBuf);
                                         _sendToNode(jsonBuf);
                                     } else {
-                                        Serial.println("[ERR] Node did not wake up (Handshake Timeout)!");
+                                        Serial.println("[ERR] Node did not wake up after 3 attempts!");
+                                        Serial.println("[ERR] Entering 15 minute cooldown");
+                                        // Gửi sleep report vì không wake được Node
+                                        _sendSleepReport();
                                     }
                                 }
                             } else {
@@ -293,18 +314,27 @@ void StateMachine::_processLoop() {
                     
                     // --- EN = 0: YÊU CẦU NGỦ ---
                     if (en == 0) {
-                        if (digitalRead(PIN_NODE_STATUS) == HIGH) {
+                        Serial.println("[LEGACY] EN=0 -> Requesting Node to SLEEP");
+                        if (_nodePwr.isNodeAwake()) {
                             _sendToNode("{\"set\":\"SLEEP\"}");
+                            vTaskDelay(500 / portTICK_PERIOD_MS);
+                            _nodePwr.confirmSleep();
                         }
+                        _sendSleepReport();
                     } 
                     // --- EN = 1: YÊU CẦU THỰC THI ---
                     else if (en == 1) {
-                        if (_wakeUpNode()) {
-                            char reqBuf[256];
-                            serializeJson(doc["req"], reqBuf, sizeof(reqBuf));
+                        _nodePwr.resetCooldown();
+                        
+                        char reqBuf[256];
+                        serializeJson(doc["req"], reqBuf, sizeof(reqBuf));
+                        _nodePwr.setPendingCommand(reqBuf);
+                        
+                        if (_nodePwr.wakeUpNode()) {
                             _sendToNode(reqBuf);
                         } else {
-                            Serial.println("[ERR] Node did not wake up (Handshake Timeout)!");
+                            Serial.println("[ERR] Node did not wake up after 3 attempts!");
+                            _sendSleepReport();
                         }
                     }
                 }
@@ -369,22 +399,85 @@ void StateMachine::_sendToNode(const char* jsonCmd) {
 }
 
 // ================= HANDSHAKE =================
-bool StateMachine::_wakeUpNode() {
-    if (digitalRead(PIN_NODE_STATUS) == HIGH) return true;
+// Removed old _wakeUpNode() - now using NodePowerManager
+
+// ================= SLEEP REPORT (Gửi khi Node ngủ) =================
+void StateMachine::_sendSleepReport() {
+    Serial.println("[PWR] Sending sleep report with default values");
     
-    digitalWrite(PIN_NODE_WAKEUP, HIGH);
-    vTaskDelay(50 / portTICK_PERIOD_MS);
-    digitalWrite(PIN_NODE_WAKEUP, LOW);
+    // Tạo JSON với giá trị mặc định khi Node ngủ
+    JsonDocument nodeDoc;
+    nodeDoc["type"] = "machine_status";
     
-    unsigned long start = millis();
-    while (millis() - start < 2000) {
-        if (digitalRead(PIN_NODE_STATUS) == HIGH) {
-            vTaskDelay(100 / portTICK_PERIOD_MS);
-            return true;
+    JsonObject content = nodeDoc["content"].to<JsonObject>();
+    content["mode"] = "MANUAL";
+    content["chamberStatus"] = 0;  // stop
+    content["doorStatus"] = 1;     // open
+    content["fanStatus"] = 0;      // off
+    content["saved_manual_cycle"] = 5;
+    content["saved_daily_meansure"] = 4;
+    content["timestamp"] = 0;  // Will be set by Gateway
+    
+    // Encode và gửi
+    uint8_t deviceId = 1;
+    uint16_t pinMv = (uint16_t)(_pwr.getCachedVoltage() * 1000);
+    bool nodeSleeping = true;  // Node đang ngủ
+    
+    uint8_t fixedBuf[32];
+    int fixedLen = FixedPacket::encodeUplinkStatus(nodeDoc, deviceId, pinMv, nodeSleeping, fixedBuf);
+    
+    Serial.printf("[TX-SLEEP] %d bytes, isSleeping=1\n", fixedLen);
+    _sendFixedToGateway(fixedBuf, fixedLen);
+}
+
+// ================= POWER MONITOR LOOP =================
+void StateMachine::_powerMonitorLoop() {
+    for (;;) {
+        // Cập nhật NodePowerManager
+        _nodePwr.update();
+        
+        // Cập nhật PowerManager (kiểm tra pin định kỳ)
+        _pwr.update();
+        
+        // Kiểm tra nếu cần vào low-power mode
+        if (_pwr.shouldEnterLowPower()) {
+            _pwr.clearLowPowerFlag();
+            _enterLowPowerMode();
         }
-        vTaskDelay(50 / portTICK_PERIOD_MS);
+        
+        vTaskDelay(1000 / portTICK_PERIOD_MS);  // Check mỗi giây
+    }
+}
+
+// ================= LOW-POWER MODE =================
+void StateMachine::_enterLowPowerMode() {
+    Serial.println("\n[PWR] *** ENTERING LOW-POWER MODE ***");
+    Serial.printf("[PWR] Battery: %.2fV (< %.1fV threshold)\n", 
+                  _pwr.getCachedVoltage(), VOLT_LOW_LIMIT);
+    
+    // 1. Gửi lệnh sleep cho Node nếu đang thức
+    if (_nodePwr.isNodeAwake()) {
+        Serial.println("[PWR] Requesting Node to sleep...");
+        _sendToNode("{\"set\":\"SLEEP\"}");
+        vTaskDelay(500 / portTICK_PERIOD_MS);
+        _nodePwr.confirmSleep();
     }
     
-    Serial.println("[ERR] Wake timeout");
-    return false;
+    // 2. Gửi sleep report cuối cùng
+    _sendSleepReport();
+    vTaskDelay(500 / portTICK_PERIOD_MS);  // Đợi gửi xong
+    
+    // 3. Tắt LoRa để tiết kiệm pin
+    Serial.println("[PWR] Disabling LoRa...");
+    LoRa.sleep();
+    
+    // 4. Vào deep-sleep 15 phút
+    Serial.printf("[PWR] Deep sleep for %d seconds...\n", LOW_POWER_SLEEP_SEC);
+    Serial.flush();
+    
+    // Sau khi wake từ deep-sleep, ESP32 sẽ reset
+    // Trong setup() sẽ kiểm tra lại pin và quyết định tiếp tục ngủ hay hoạt động
+    _pwr.deepSleep(LOW_POWER_SLEEP_SEC);
+    
+    // Không bao giờ đến đây (deep-sleep = reset)
 }

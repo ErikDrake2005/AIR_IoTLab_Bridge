@@ -20,14 +20,14 @@ enum FixedPacketType : uint8_t {
     PKT_LEGACY           = 0xFF,  // Fallback to dictionary encoding
 };
 
-// ── UPLINK_DATA: Sensor readings (23 bytes total) ──
+// ── UPLINK_DATA: Sensor readings (21 bytes total) ──
+// Removed rssi/snr, added isSleeping
 #pragma pack(push, 1)
 struct UplinkDataPacket {
     uint8_t  type;       // = PKT_UPLINK_DATA (0x01)
     uint8_t  deviceId;   // Bridge ID
     uint16_t pinMv;      // Battery voltage in mV
-    int16_t  rssi;       // RSSI dBm
-    int16_t  snrX10;     // SNR x10 (e.g., 85 = 8.5 dB)
+    uint8_t  isSleeping; // 0=Node awake, 1=Node sleeping
     int16_t  tempX100;   // Temperature x100 (e.g., 2750 = 27.50°C)
     int16_t  humX100;    // Humidity x100 (e.g., 6500 = 65.00%)
     int16_t  ch4;        // CH4 ppm
@@ -39,14 +39,14 @@ struct UplinkDataPacket {
 };
 #pragma pack(pop)
 
-// ── UPLINK_STATUS: Machine status (13 bytes total) ──
+// ── UPLINK_STATUS: Machine status (11 bytes total) ──
+// Removed rssi/snr, added isSleeping
 #pragma pack(push, 1)
 struct UplinkStatusPacket {
     uint8_t  type;       // = PKT_UPLINK_STATUS (0x02)
     uint8_t  deviceId;   // Bridge ID
     uint16_t pinMv;      // Battery voltage in mV
-    int16_t  rssi;       // RSSI dBm
-    int16_t  snrX10;     // SNR x10
+    uint8_t  isSleeping; // 0=Node awake, 1=Node sleeping
     uint8_t  flags;      // bit0=mode(0=AUTO,1=MANUAL), bit1=measuring, bit2=door, bit3=fan
     uint8_t  manualCycle;     // saved_manual_cycle
     uint8_t  dailyMeasures;   // saved_daily_meansure
@@ -60,14 +60,14 @@ struct UplinkStatusPacket {
 #define STATUS_FLAG_DOOR_OPEN     0x04  // bit2: 1=door open
 #define STATUS_FLAG_FAN_ON        0x08  // bit3: 1=fan on
 
-// ── UPLINK_TIME_REQ: Time sync request (9 bytes total) ──
+// ── UPLINK_TIME_REQ: Time sync request (5 bytes total) ──
+// Removed rssi/snr
 #pragma pack(push, 1)
 struct UplinkTimeReqPacket {
     uint8_t  type;       // = PKT_UPLINK_TIME_REQ (0x03)
     uint8_t  deviceId;   // Bridge ID
     uint16_t pinMv;      // Battery voltage in mV
-    int16_t  rssi;       // RSSI dBm
-    int16_t  snrX10;     // SNR x10
+    uint8_t  isSleeping; // 0=Node awake, 1=Node sleeping
 };
 #pragma pack(pop)
 
@@ -255,18 +255,17 @@ private:
 class FixedPacket {
 public:
     // ── BRIDGE: Encode Uplink DATA packet (Node JSON → Fixed Binary) ──
-    // Input: Parsed JSON from Node + Bridge metadata (deviceId, pin, rssi, snr)
-    // Output: Fixed-schema binary packet (27 bytes)
+    // Input: Parsed JSON from Node + Bridge metadata (deviceId, pin, isSleeping)
+    // Output: Fixed-schema binary packet (21 bytes)
     static int encodeUplinkData(JsonDocument& nodeDoc, uint8_t deviceId, uint16_t pinMv, 
-                                 int rssi, float snr, uint8_t* buffer) {
+                                 bool nodeSleeping, uint8_t* buffer) {
         UplinkDataPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         
         pkt.type = PKT_UPLINK_DATA;
         pkt.deviceId = deviceId;
         pkt.pinMv = pinMv;
-        pkt.rssi = (int16_t)rssi;
-        pkt.snrX10 = (int16_t)(snr * 10);
+        pkt.isSleeping = nodeSleeping ? 1 : 0;
         
         // Extract sensor data from "content" object
         JsonObject content = nodeDoc["content"];
@@ -285,15 +284,14 @@ public:
     
     // ── BRIDGE: Encode Uplink STATUS packet (Node JSON → Fixed Binary) ──
     static int encodeUplinkStatus(JsonDocument& nodeDoc, uint8_t deviceId, uint16_t pinMv,
-                                   int rssi, float snr, uint8_t* buffer) {
+                                   bool nodeSleeping, uint8_t* buffer) {
         UplinkStatusPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
         
         pkt.type = PKT_UPLINK_STATUS;
         pkt.deviceId = deviceId;
         pkt.pinMv = pinMv;
-        pkt.rssi = (int16_t)rssi;
-        pkt.snrX10 = (int16_t)(snr * 10);
+        pkt.isSleeping = nodeSleeping ? 1 : 0;
         
         // Extract status from "content" object
         JsonObject content = nodeDoc["content"];
@@ -324,13 +322,12 @@ public:
     }
     
     // ── BRIDGE: Encode Uplink TIME_REQ packet ──
-    static int encodeUplinkTimeReq(uint8_t deviceId, uint16_t pinMv, int rssi, float snr, uint8_t* buffer) {
+    static int encodeUplinkTimeReq(uint8_t deviceId, uint16_t pinMv, bool nodeSleeping, uint8_t* buffer) {
         UplinkTimeReqPacket pkt;
         pkt.type = PKT_UPLINK_TIME_REQ;
         pkt.deviceId = deviceId;
         pkt.pinMv = pinMv;
-        pkt.rssi = (int16_t)rssi;
-        pkt.snrX10 = (int16_t)(snr * 10);
+        pkt.isSleeping = nodeSleeping ? 1 : 0;
         
         memcpy(buffer, &pkt, sizeof(pkt));
         return sizeof(pkt);
@@ -359,8 +356,7 @@ public:
                 
                 doc["device_ID"] = pkt->deviceId;
                 doc["pin"] = pkt->pinMv;
-                doc["rssi"] = pkt->rssi;
-                doc["snr"] = pkt->snrX10 / 10.0f;
+                doc["isSleeping"] = pkt->isSleeping;
                 
                 JsonObject node = doc["node"].to<JsonObject>();
                 node["type"] = "data";
@@ -383,17 +379,16 @@ public:
                 
                 doc["device_ID"] = pkt->deviceId;
                 doc["pin"] = pkt->pinMv;
-                doc["rssi"] = pkt->rssi;
-                doc["snr"] = pkt->snrX10 / 10.0f;
+                doc["isSleeping"] = pkt->isSleeping;
                 
                 JsonObject node = doc["node"].to<JsonObject>();
                 node["type"] = "machine_status";
                 
                 JsonObject content = node["content"].to<JsonObject>();
                 content["mode"] = (pkt->flags & STATUS_FLAG_MODE_MANUAL) ? "MANUAL" : "AUTO";
-                content["measure_status"] = (pkt->flags & STATUS_FLAG_MEASURING) ? 1 : 0;
-                content["door"] = (pkt->flags & STATUS_FLAG_DOOR_OPEN) ? "open" : "close";
-                content["fan"] = (pkt->flags & STATUS_FLAG_FAN_ON) ? "on" : "off";
+                content["chamberStatus"] = (pkt->flags & STATUS_FLAG_MEASURING) ? 1 : 0;
+                content["doorStatus"] = (pkt->flags & STATUS_FLAG_DOOR_OPEN) ? 1 : 0;
+                content["fanStatus"] = (pkt->flags & STATUS_FLAG_FAN_ON) ? 1 : 0;
                 content["saved_manual_cycle"] = pkt->manualCycle;
                 content["saved_daily_meansure"] = pkt->dailyMeasures;
                 content["timestamp"] = pkt->timestamp;
@@ -406,8 +401,7 @@ public:
                 
                 doc["device_ID"] = pkt->deviceId;
                 doc["pin"] = pkt->pinMv;
-                doc["rssi"] = pkt->rssi;
-                doc["snr"] = pkt->snrX10 / 10.0f;
+                doc["isSleeping"] = pkt->isSleeping;
                 
                 JsonObject node = doc["node"].to<JsonObject>();
                 node["type"] = "time_req";
