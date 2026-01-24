@@ -212,7 +212,8 @@ void StateMachine::_processLoop() {
                 
                 // ═══ TRY FIXED-SCHEMA DOWNLINK FIRST ═══
                 if (decLen > 0 && FixedPacket::isFixedDownlink(decryptedBuf[0])) {
-                    // Fixed TIME_SYNC packet
+                    
+                    // ─── Fixed TIME_SYNC packet (0x80) ───
                     if (decryptedBuf[0] == PKT_DOWNLINK_TIME) {
                         uint32_t epoch = 0;
                         if (FixedPacket::decodeDownlinkTime(decryptedBuf, decLen, epoch)) {
@@ -227,10 +228,60 @@ void StateMachine::_processLoop() {
                             }
                         }
                     }
+                    // ─── Fixed CMD packet (0x81) ───
+                    else if (decryptedBuf[0] == PKT_DOWNLINK_CMD) {
+                        uint8_t targetId = 0;
+                        uint8_t en = 0;
+                        char jsonBuf[256];
+                        
+                        // Debug: Print raw packet bytes
+                        Serial.printf("[RX-FIXED-RAW] CMD bytes: ");
+                        for (int i = 0; i < decLen && i < 10; i++) {
+                            Serial.printf("%02X ", decryptedBuf[i]);
+                        }
+                        Serial.println();
+                        
+                        if (FixedPacket::decodeDownlinkCmd(decryptedBuf, decLen, targetId, en, jsonBuf, sizeof(jsonBuf))) {
+                            // Check NID: targetId 0 = ALL, hoặc khớp với ID của Bridge
+                            // BRIDGE_DEVICE_ID = "NODE_01" -> ID = 1
+                            // Parse from BRIDGE_DEVICE_ID
+                            uint8_t myId = 1;
+                            const char* lastUnderscore = strrchr(BRIDGE_DEVICE_ID, '_');
+                            if (lastUnderscore) {
+                                myId = (uint8_t)atoi(lastUnderscore + 1);
+                            }
+                            
+                            Serial.printf("[RX-FIXED] CMD targetId=%d myId=%d en=%d\n", targetId, myId, en);
+                            
+                            if (targetId == 0 || targetId == myId) {
+                                // EN = 0: Yêu cầu ngủ
+                                if (en == 0) {
+                                    Serial.println("[CMD] EN=0 -> Requesting Node to SLEEP");
+                                    if (digitalRead(PIN_NODE_STATUS) == HIGH) {
+                                        _sendToNode("{\"set\":\"SLEEP\"}");
+                                    }
+                                }
+                                // EN = 1: Thực thi lệnh
+                                else {
+                                    Serial.printf("[CMD] EN=1 -> Waking Node and sending: %s\n", jsonBuf);
+                                    if (_wakeUpNode()) {
+                                        Serial.printf("[TX-NODE] %s\n", jsonBuf);
+                                        _sendToNode(jsonBuf);
+                                    } else {
+                                        Serial.println("[ERR] Node did not wake up (Handshake Timeout)!");
+                                    }
+                                }
+                            } else {
+                                Serial.printf("[RX-FIXED] CMD ignored (target=%d, my=%d)\n", targetId, myId);
+                            }
+                        } else {
+                            Serial.println("[ERR] Failed to decode CMD packet");
+                        }
+                    }
                     continue;
                 }
                 
-                // ═══ LEGACY DICTIONARY DECODING ═══
+                // ═══ LEGACY DICTIONARY DECODING (Fallback) ═══
                 JsonDocument doc;
                 PacketUtils::decodeBinaryToJson(decryptedBuf, decLen, doc);
                 Serial.printf("[RX-LEGACY] %d bytes\n", decLen);

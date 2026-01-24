@@ -79,6 +79,42 @@ struct DownlinkTimePacket {
 };
 #pragma pack(pop)
 
+// ── DOWNLINK_CMD: Command packet (10 bytes total) ──
+// Thay thế Legacy Dictionary, tiết kiệm ~80% băng thông
+#pragma pack(push, 1)
+struct DownlinkCmdPacket {
+    uint8_t  type;           // = PKT_DOWNLINK_CMD (0x81)
+    uint8_t  targetId;       // 0=ALL, 1-255=specific Bridge ID
+    uint8_t  en;             // 0=sleep, 1=execute
+    uint8_t  setMode;        // 0=AUTO, 1=MANUAL, 2=TIMESTAMP, 3=SLEEP
+    uint8_t  intervalMin;    // transmissionIntervalMinutes (0=null, 1-59=value)
+    uint8_t  measureCount;   // measurementCount for AUTO (0=null)
+    uint16_t startTimeMin;   // startTime as minutes from 00:00 (0xFFFF=null)
+    uint8_t  doFlags;        // MANUAL: bit0-1=chamber, bit2-3=door, bit4-5=fan
+};
+#pragma pack(pop)
+
+// ── DOWNLINK_CMD doFlags encoding ──
+// For MANUAL mode actions (2 bits each: 0=null/ignore, 1=stop/close/off, 2=start/open/on)
+#define CMD_FLAG_CHAMBER_MASK    0x03  // bit0-1
+#define CMD_FLAG_CHAMBER_NULL    0x00
+#define CMD_FLAG_CHAMBER_STOP    0x01  // stop-measurement
+#define CMD_FLAG_CHAMBER_START   0x02  // start-measurement
+#define CMD_FLAG_DOOR_MASK       0x0C  // bit2-3
+#define CMD_FLAG_DOOR_NULL       0x00
+#define CMD_FLAG_DOOR_CLOSE      0x04  // close
+#define CMD_FLAG_DOOR_OPEN       0x08  // open
+#define CMD_FLAG_FAN_MASK        0x30  // bit4-5
+#define CMD_FLAG_FAN_NULL        0x00
+#define CMD_FLAG_FAN_OFF         0x10  // off
+#define CMD_FLAG_FAN_ON          0x20  // on
+
+// ── setMode values ──
+#define CMD_MODE_AUTO      0
+#define CMD_MODE_MANUAL    1
+#define CMD_MODE_TIMESTAMP 2
+#define CMD_MODE_SLEEP     3
+
 // ═══════════════════════════════════════════════════════════════════════
 // LEGACY DICTIONARY ENCODING (Vẫn giữ cho commands và backward compat)
 // ═══════════════════════════════════════════════════════════════════════
@@ -267,14 +303,17 @@ public:
         const char* mode = content["mode"] | "AUTO";
         if (strcmp(mode, "MANUAL") == 0) pkt.flags |= STATUS_FLAG_MODE_MANUAL;
         
-        int measuring = content["measure_status"] | 0;
-        if (measuring == 1) pkt.flags |= STATUS_FLAG_MEASURING;
+        // chamberStatus: 1=measuring, 0=stop
+        int chamberStatus = content["chamberStatus"] | 0;
+        if (chamberStatus == 1) pkt.flags |= STATUS_FLAG_MEASURING;
         
-        const char* door = content["door"] | "close";
-        if (strcmp(door, "open") == 0) pkt.flags |= STATUS_FLAG_DOOR_OPEN;
+        // doorStatus: 1=open, 0=close
+        int doorStatus = content["doorStatus"] | 0;
+        if (doorStatus == 1) pkt.flags |= STATUS_FLAG_DOOR_OPEN;
         
-        const char* fan = content["fan"] | "off";
-        if (strcmp(fan, "on") == 0) pkt.flags |= STATUS_FLAG_FAN_ON;
+        // fanStatus: 1=on, 0=off
+        int fanStatus = content["fanStatus"] | 0;
+        if (fanStatus == 1) pkt.flags |= STATUS_FLAG_FAN_ON;
         
         pkt.manualCycle = content["saved_manual_cycle"] | 0;
         pkt.dailyMeasures = content["saved_daily_meansure"] | 0;
@@ -391,6 +430,115 @@ public:
         return true;
     }
     
+    // ── BRIDGE: Decode Downlink CMD packet → JSON cho Node ──
+    // Trả về: targetId để Bridge kiểm tra NID, và tạo JSON gửi xuống Node
+    static bool decodeDownlinkCmd(uint8_t* buffer, int len, uint8_t& targetId, uint8_t& en,
+                                   char* jsonBuf, int jsonBufSize) {
+        if (len < (int)sizeof(DownlinkCmdPacket)) return false;
+        if (buffer[0] != PKT_DOWNLINK_CMD) return false;
+        
+        DownlinkCmdPacket* pkt = (DownlinkCmdPacket*)buffer;
+        targetId = pkt->targetId;
+        en = pkt->en;
+        
+        // Nếu en = 0, gửi lệnh SLEEP
+        if (en == 0) {
+            snprintf(jsonBuf, jsonBufSize, "{\"set\":\"SLEEP\"}");
+            return true;
+        }
+        
+        // Build JSON based on setMode
+        JsonDocument doc;
+        
+        // ═══ TIMESTAMP MODE ═══
+        if (pkt->setMode == CMD_MODE_TIMESTAMP) {
+            // Timestamp được encode trong các field khác (không có trong CMD packet)
+            // Trường hợp này nên dùng PKT_DOWNLINK_TIME thay vì CMD
+            doc["set"] = "TIMESTAMP";
+            doc["cmd"] = 0;  // Placeholder - timestamp should use TIME packet
+        }
+        // ═══ SLEEP MODE ═══
+        else if (pkt->setMode == CMD_MODE_SLEEP) {
+            snprintf(jsonBuf, jsonBufSize, "{\"set\":\"SLEEP\"}");
+            return true;
+        }
+        // ═══ AUTO MODE ═══
+        else if (pkt->setMode == CMD_MODE_AUTO) {
+            doc["set"] = "AUTO";
+            
+            JsonObject cmd = doc["cmd"].to<JsonObject>();
+            cmd["transmissionIntervalMinutes"] = (char*)nullptr;  // null cho AUTO
+            
+            JsonObject doObj = cmd["do"].to<JsonObject>();
+            
+            // measurementCount
+            if (pkt->measureCount == 0) {
+                doObj["measurementCount"] = (char*)nullptr;
+            } else {
+                doObj["measurementCount"] = pkt->measureCount;
+            }
+            
+            // startTime (convert minutes → "HH:MM")
+            if (pkt->startTimeMin == 0xFFFF) {
+                doObj["startTime"] = (char*)nullptr;
+            } else {
+                char timeBuf[8];
+                int hour = pkt->startTimeMin / 60;
+                int minute = pkt->startTimeMin % 60;
+                snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", hour, minute);
+                doObj["startTime"] = timeBuf;
+            }
+        }
+        // ═══ MANUAL MODE ═══
+        else if (pkt->setMode == CMD_MODE_MANUAL) {
+            doc["set"] = "MANUAL";
+            
+            JsonObject cmd = doc["cmd"].to<JsonObject>();
+            
+            // transmissionIntervalMinutes
+            if (pkt->intervalMin == 0) {
+                cmd["transmissionIntervalMinutes"] = (char*)nullptr;
+            } else {
+                cmd["transmissionIntervalMinutes"] = pkt->intervalMin;
+            }
+            
+            JsonObject doObj = cmd["do"].to<JsonObject>();
+            
+            // chamberStatus
+            uint8_t chamber = pkt->doFlags & CMD_FLAG_CHAMBER_MASK;
+            if (chamber == CMD_FLAG_CHAMBER_START) {
+                doObj["chamberStatus"] = "start-measurement";
+            } else if (chamber == CMD_FLAG_CHAMBER_STOP) {
+                doObj["chamberStatus"] = "stop-measurement";
+            } else {
+                doObj["chamberStatus"] = (char*)nullptr;
+            }
+            
+            // doorStatus
+            uint8_t door = pkt->doFlags & CMD_FLAG_DOOR_MASK;
+            if (door == CMD_FLAG_DOOR_OPEN) {
+                doObj["doorStatus"] = "open";
+            } else if (door == CMD_FLAG_DOOR_CLOSE) {
+                doObj["doorStatus"] = "close";
+            } else {
+                doObj["doorStatus"] = (char*)nullptr;
+            }
+            
+            // fanStatus
+            uint8_t fan = pkt->doFlags & CMD_FLAG_FAN_MASK;
+            if (fan == CMD_FLAG_FAN_ON) {
+                doObj["fanStatus"] = "ON";
+            } else if (fan == CMD_FLAG_FAN_OFF) {
+                doObj["fanStatus"] = "OFF";
+            } else {
+                doObj["fanStatus"] = (char*)nullptr;
+            }
+        }
+        
+        serializeJson(doc, jsonBuf, jsonBufSize);
+        return true;
+    }
+    
     // ── Check if packet is Fixed-Schema (uplink) ──
     static bool isFixedUplink(uint8_t firstByte) {
         return (firstByte == PKT_UPLINK_DATA || 
@@ -400,6 +548,6 @@ public:
     
     // ── Check if packet is Fixed-Schema (downlink) ──
     static bool isFixedDownlink(uint8_t firstByte) {
-        return (firstByte == PKT_DOWNLINK_TIME);
+        return (firstByte == PKT_DOWNLINK_TIME || firstByte == PKT_DOWNLINK_CMD);
     }
 };
