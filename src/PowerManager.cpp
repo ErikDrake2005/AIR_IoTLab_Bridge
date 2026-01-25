@@ -2,7 +2,31 @@
 
 void PowerManager::begin() { 
     pinMode(PIN_BAT_ADC, INPUT);
-    Serial.println("[PWR] PowerManager initialized");
+    _cachedVoltage = getVoltage();
+    _lastCheckMs = millis();
+    _lowPowerMode = false;
+    _shouldEnterLowPower = false;
+    Serial.printf("[PWR] PowerManager initialized, V=%.2fV\n", _cachedVoltage);
+}
+
+void PowerManager::update() {
+    // Kiểm tra pin định kỳ mỗi BAT_CHECK_INTERVAL_MS (1 phút)
+    if (millis() - _lastCheckMs >= BAT_CHECK_INTERVAL_MS) {
+        _lastCheckMs = millis();
+        _cachedVoltage = getVoltage();
+        
+        Serial.printf("[PWR] Battery check: %.2fV\n", _cachedVoltage);
+        
+        // Kiểm tra trạng thái
+        if (!_lowPowerMode && isBatteryLow()) {
+            Serial.println("[PWR] *** BATTERY LOW! Should enter low-power mode ***");
+            _shouldEnterLowPower = true;
+        }
+        else if (_lowPowerMode && isBatteryOk()) {
+            Serial.println("[PWR] Battery recovered, can exit low-power mode");
+            _lowPowerMode = false;
+        }
+    }
 }
 
 float PowerManager::getVoltage() {
@@ -28,11 +52,16 @@ float PowerManager::getVoltage() {
     return voltage;
 }
 
+float PowerManager::getCachedVoltage() {
+    return _cachedVoltage;
+}
+
 // Detect if battery is connected or external power (adapter) is used
-// Returns true if external power is detected (battery pins open, < 0.3V)
+// Returns true if external power detected (voltage < 0.5V means battery pins open)
 bool PowerManager::isAdapterConnected() { 
-    float v = getVoltage();
-    return v < ADAPTER_VOLT;  // < 0.3V means battery not connected, using adapter
+    float v = getCachedVoltage();
+    if (v == 0.0) v = getVoltage();  // Fallback
+    return v < ADAPTER_DETECT_VOLT;  // < 0.5V means battery not connected, using adapter
 }
 
 bool PowerManager::isBatteryLow() {
@@ -40,8 +69,9 @@ bool PowerManager::isBatteryLow() {
         // External power detected - assume full charge
         return false; 
     }
-    float v = getVoltage();
-    return v < VOLT_LOW_LIMIT;
+    float v = getCachedVoltage();
+    if (v == 0.0) v = getVoltage();
+    return v < VOLT_LOW_LIMIT;  // < 3.7V
 }
 
 // Check if battery is OK or has recovered
@@ -51,12 +81,23 @@ bool PowerManager::isBatteryOk() {
         // External power detected - always OK
         return true;
     }
-    float v = getVoltage();
-    return v >= VOLT_RECOVERY;
+    float v = getCachedVoltage();
+    if (v == 0.0) v = getVoltage();
+    return v >= VOLT_RECOVERY;  // >= 3.9V
 }
 
-void PowerManager::sleepForSeconds(uint64_t seconds) {
-    Serial.printf("[PWR] Light Sleep %llu s\n", seconds);
+void PowerManager::deepSleep(uint64_t seconds) {
+    Serial.printf("[PWR] Deep Sleep for %llu seconds\n", seconds);
+    Serial.flush();
+    delay(10);
+    
+    esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
+    esp_deep_sleep_start();
+    // Không trở về từ deep sleep - sẽ reset
+}
+
+void PowerManager::lightSleep(uint64_t seconds) {
+    Serial.printf("[PWR] Light Sleep for %llu seconds\n", seconds);
     Serial.flush();
     esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
     esp_light_sleep_start();
