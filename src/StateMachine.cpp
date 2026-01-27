@@ -159,7 +159,14 @@ void StateMachine::_processLoop() {
 
                 // 2. Kiểm tra loại gói tin để chọn Fixed-Schema hoặc Legacy
                 const char* nodeType = nodeDoc["type"] | "";
-                uint8_t deviceId = 1; // Bridge ID (có thể config sau)
+                
+                // Parse device ID từ BRIDGE_DEVICE_ID (e.g., "NODE_01" -> 1)
+                uint8_t deviceId = 1;
+                const char* lastUnderscore = strrchr(BRIDGE_DEVICE_ID, '_');
+                if (lastUnderscore) {
+                    deviceId = (uint8_t)atoi(lastUnderscore + 1);
+                }
+                
                 uint16_t pinMv = (uint16_t)(_pwr.getCachedVoltage() * 1000);
                 bool nodeSleeping = _nodePwr.isNodeSleeping();
                 

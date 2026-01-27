@@ -343,6 +343,109 @@ public:
         return sizeof(pkt);
     }
     
+    // ── GATEWAY: Encode Downlink CMD packet from JSON ──
+    static int encodeDownlinkCmd(JsonDocument& doc, uint8_t* buffer) {
+        DownlinkCmdPacket pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        
+        pkt.type = PKT_DOWNLINK_CMD;
+        
+        // targetId = NID (from "NID" field - string to int)
+        const char* nid = doc["NID"] | "1";
+        // Parse NODE_XX format
+        const char* lastUnderscore = strrchr(nid, '_');
+        if (lastUnderscore) {
+            pkt.targetId = (uint8_t)atoi(lastUnderscore + 1);
+        } else {
+            pkt.targetId = (uint8_t)atoi(nid);
+        }
+        
+        // en field (0 = sleep/disable, 1 = execute)
+        pkt.en = doc["en"] | 1;
+        
+        // If en = 0, just send SLEEP command
+        if (pkt.en == 0) {
+            pkt.setMode = CMD_MODE_SLEEP;
+            memcpy(buffer, &pkt, sizeof(pkt));
+            return sizeof(pkt);
+        }
+        
+        // Parse "set" field
+        const char* setMode = doc["set"] | "";
+        
+        if (strcmp(setMode, "AUTO") == 0) {
+            pkt.setMode = CMD_MODE_AUTO;
+            
+            JsonObject cmd = doc["cmd"];
+            JsonObject doObj = cmd["do"];
+            
+            // measurementCount
+            if (!doObj["measurementCount"].isNull()) {
+                pkt.measureCount = doObj["measurementCount"].as<uint8_t>();
+            }
+            
+            // startTime (parse "HH:MM" format)
+            if (!doObj["startTime"].isNull()) {
+                const char* timeStr = doObj["startTime"] | "";
+                int hour = 0, minute = 0;
+                sscanf(timeStr, "%d:%d", &hour, &minute);
+                pkt.startTimeMin = hour * 60 + minute;
+            } else {
+                pkt.startTimeMin = 0xFFFF;  // null marker
+            }
+        }
+        else if (strcmp(setMode, "MANUAL") == 0) {
+            pkt.setMode = CMD_MODE_MANUAL;
+            
+            JsonObject cmd = doc["cmd"];
+            JsonObject doObj = cmd["do"];
+            
+            // transmissionIntervalMinutes
+            if (!cmd["transmissionIntervalMinutes"].isNull()) {
+                pkt.intervalMin = cmd["transmissionIntervalMinutes"].as<uint8_t>();
+            }
+            
+            // chamberStatus
+            if (!doObj["chamberStatus"].isNull()) {
+                const char* chamber = doObj["chamberStatus"] | "";
+                if (strstr(chamber, "start")) {
+                    pkt.doFlags |= CMD_FLAG_CHAMBER_START;
+                } else if (strstr(chamber, "stop")) {
+                    pkt.doFlags |= CMD_FLAG_CHAMBER_STOP;
+                }
+            }
+            
+            // doorStatus
+            if (!doObj["doorStatus"].isNull()) {
+                const char* door = doObj["doorStatus"] | "";
+                if (strcmp(door, "open") == 0) {
+                    pkt.doFlags |= CMD_FLAG_DOOR_OPEN;
+                } else if (strcmp(door, "close") == 0) {
+                    pkt.doFlags |= CMD_FLAG_DOOR_CLOSE;
+                }
+            }
+            
+            // fanStatus
+            if (!doObj["fanStatus"].isNull()) {
+                const char* fan = doObj["fanStatus"] | "";
+                if (strcmp(fan, "ON") == 0 || strcmp(fan, "on") == 0) {
+                    pkt.doFlags |= CMD_FLAG_FAN_ON;
+                } else if (strcmp(fan, "OFF") == 0 || strcmp(fan, "off") == 0) {
+                    pkt.doFlags |= CMD_FLAG_FAN_OFF;
+                }
+            }
+        }
+        else if (strcmp(setMode, "SLEEP") == 0) {
+            pkt.setMode = CMD_MODE_SLEEP;
+        }
+        else if (strcmp(setMode, "TIMESTAMP") == 0) {
+            pkt.setMode = CMD_MODE_TIMESTAMP;
+        }
+        
+        memcpy(buffer, &pkt, sizeof(pkt));
+        return sizeof(pkt);
+    }
+    
     // ── GATEWAY: Decode Uplink packets to JSON (for MQTT) ──
     static bool decodeUplinkToJson(uint8_t* buffer, int len, JsonDocument& doc) {
         if (len < 1) return false;
