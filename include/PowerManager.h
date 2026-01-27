@@ -7,8 +7,10 @@ public:
     void begin();
     void update();  // Gọi trong loop để kiểm tra pin định kỳ
     
-    float getVoltage();        // Đọc ngay lập tức
+    float getVoltage();        // Đọc điện áp thực (V)
     float getCachedVoltage();  // Trả về giá trị cached (nhanh hơn)
+    int getBatteryPercent();   // Đọc % pin (0-100%)
+    int getCachedPercent();    // Trả về % cached
     
     bool isBatteryLow();       
     bool isBatteryOk();        
@@ -23,7 +25,10 @@ public:
     
 private:
     float _cachedVoltage = 0.0;
+    int _cachedPercent = 0;
     unsigned long _lastCheckMs = 0;
     bool _lowPowerMode = false;
     bool _shouldEnterLowPower = false;
+    
+    int _voltageToPercent(float voltage);  // Convert voltage to 0-100%
 };
