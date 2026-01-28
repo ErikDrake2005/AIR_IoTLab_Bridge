@@ -32,7 +32,7 @@
 
 // ========== POWER & BATTERY MONITORING (12.6V 3S LiPo) ==========
 #define PIN_BAT_ADC           35    // GPIO35 (ADC1_CH7) for battery ADC
-#define BAT_DIVIDER           3.76f // K^-1 = 12.4/3.3 (voltage divider inverse ratio)
+#define BAT_DIVIDER           4.13f // Calibrated from real measurements
 #define BAT_FULL_VOLTAGE      12.6f // 3S LiPo full charge (4.2V x 3)
 #define BAT_EMPTY_VOLTAGE     9.0f  // 3S LiPo empty (3.0V x 3)
 #define ADAPTER_DETECT_VOLT   2.0f  // Below this = adapter/debug mode (no battery)

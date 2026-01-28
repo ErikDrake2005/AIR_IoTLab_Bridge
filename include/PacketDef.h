@@ -344,6 +344,9 @@ public:
     }
     
     // ── GATEWAY: Encode Downlink CMD packet from JSON ──
+    // Supports both formats:
+    // Format 1 (MQTT): {"NID":"NODE_01","en":1,"req":{"set":"MANUAL","cmd":{...}}}
+    // Format 2 (direct): {"NID":"NODE_01","en":1,"set":"MANUAL","cmd":{...}}
     static int encodeDownlinkCmd(JsonDocument& doc, uint8_t* buffer) {
         DownlinkCmdPacket pkt;
         memset(&pkt, 0, sizeof(pkt));
@@ -370,13 +373,21 @@ public:
             return sizeof(pkt);
         }
         
-        // Parse "set" field
-        const char* setMode = doc["set"] | "";
+        // Support both formats: check if "req" exists (MQTT format)
+        JsonObject reqObj;
+        if (doc["req"].is<JsonObject>()) {
+            reqObj = doc["req"].as<JsonObject>();
+        } else {
+            reqObj = doc.as<JsonObject>();  // Direct format
+        }
+        
+        // Parse "set" field from req object
+        const char* setMode = reqObj["set"] | "";
+        JsonObject cmd = reqObj["cmd"];
         
         if (strcmp(setMode, "AUTO") == 0) {
             pkt.setMode = CMD_MODE_AUTO;
             
-            JsonObject cmd = doc["cmd"];
             JsonObject doObj = cmd["do"];
             
             // measurementCount
@@ -397,7 +408,6 @@ public:
         else if (strcmp(setMode, "MANUAL") == 0) {
             pkt.setMode = CMD_MODE_MANUAL;
             
-            JsonObject cmd = doc["cmd"];
             JsonObject doObj = cmd["do"];
             
             // transmissionIntervalMinutes
@@ -452,14 +462,21 @@ public:
         
         uint8_t type = buffer[0];
         
+        // Helper to format device_ID as "NODE_XX"
+        auto formatDeviceId = [](uint8_t id, char* buf, int bufSize) {
+            snprintf(buf, bufSize, "NODE_%02d", id);
+        };
+        char deviceIdStr[16];
+        
         switch (type) {
             case PKT_UPLINK_DATA: {
                 if (len < (int)sizeof(UplinkDataPacket)) return false;
                 UplinkDataPacket* pkt = (UplinkDataPacket*)buffer;
                 
-                doc["device_ID"] = pkt->deviceId;
+                formatDeviceId(pkt->deviceId, deviceIdStr, sizeof(deviceIdStr));
+                doc["device_ID"] = deviceIdStr;
                 doc["pin"] = pkt->pinMv;
-                doc["isSleeping"] = pkt->isSleeping;
+                doc["isSleeping"] = pkt->isSleeping ? true : false;
                 
                 JsonObject node = doc["node"].to<JsonObject>();
                 node["type"] = "data";
@@ -480,9 +497,10 @@ public:
                 if (len < (int)sizeof(UplinkStatusPacket)) return false;
                 UplinkStatusPacket* pkt = (UplinkStatusPacket*)buffer;
                 
-                doc["device_ID"] = pkt->deviceId;
+                formatDeviceId(pkt->deviceId, deviceIdStr, sizeof(deviceIdStr));
+                doc["device_ID"] = deviceIdStr;
                 doc["pin"] = pkt->pinMv;
-                doc["isSleeping"] = pkt->isSleeping;
+                doc["isSleeping"] = pkt->isSleeping ? true : false;
                 
                 JsonObject node = doc["node"].to<JsonObject>();
                 node["type"] = "machine_status";
@@ -502,9 +520,10 @@ public:
                 if (len < (int)sizeof(UplinkTimeReqPacket)) return false;
                 UplinkTimeReqPacket* pkt = (UplinkTimeReqPacket*)buffer;
                 
-                doc["device_ID"] = pkt->deviceId;
+                formatDeviceId(pkt->deviceId, deviceIdStr, sizeof(deviceIdStr));
+                doc["device_ID"] = deviceIdStr;
                 doc["pin"] = pkt->pinMv;
-                doc["isSleeping"] = pkt->isSleeping;
+                doc["isSleeping"] = pkt->isSleeping ? true : false;
                 
                 JsonObject node = doc["node"].to<JsonObject>();
                 node["type"] = "time_req";

@@ -101,7 +101,7 @@ bool PowerManager::isBatteryLow() {
     }
     float v = getCachedVoltage();
     if (v == 0.0) v = getVoltage();
-    return v < VOLT_LOW_LIMIT;  // < 3.7V
+    return v < VOLT_LOW_LIMIT;  // < 10.2V (3S LiPo ~33%)
 }
 
 // Check if battery is OK or has recovered
@@ -113,7 +113,7 @@ bool PowerManager::isBatteryOk() {
     }
     float v = getCachedVoltage();
     if (v == 0.0) v = getVoltage();
-    return v >= VOLT_RECOVERY;  // >= 3.9V
+    return v >= VOLT_RECOVERY;  // >= 11.1V (3S LiPo ~58%)
 }
 
 void PowerManager::deepSleep(uint64_t seconds) {
