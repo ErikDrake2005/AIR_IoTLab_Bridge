@@ -30,13 +30,14 @@
 #define LORA_MISO_PIN   19
 #define LORA_MOSI_PIN   23
 
-// ========== POWER & BATTERY MONITORING ==========
-#define PIN_BAT_ADC           15    // GPIO15 for battery ADC
-#define BAT_DIVIDER           2.0   // Voltage divider ratio (4.2V -> 2.1V)
-#define BAT_MAX_VOLTAGE       2.1   // Max voltage at ADC pin
-#define ADAPTER_DETECT_VOLT   0.5   // Below this = adapter/debug mode (no battery)
-#define VOLT_LOW_LIMIT        3.7   // Enter low-power mode below this
-#define VOLT_RECOVERY         3.9   // Exit low-power mode above this
+// ========== POWER & BATTERY MONITORING (12.6V 3S LiPo) ==========
+#define PIN_BAT_ADC           35    // GPIO35 (ADC1_CH7) for battery ADC
+#define BAT_DIVIDER           4.13f // Calibrated from real measurements
+#define BAT_FULL_VOLTAGE      12.6f // 3S LiPo full charge (4.2V x 3)
+#define BAT_EMPTY_VOLTAGE     9.0f  // 3S LiPo empty (3.0V x 3)
+#define ADAPTER_DETECT_VOLT   2.0f  // Below this = adapter/debug mode (no battery)
+#define VOLT_LOW_LIMIT        10.2f // Enter low-power mode below this (~33%)
+#define VOLT_RECOVERY         11.1f // Exit low-power mode above this (~58%)
 #define BAT_CHECK_INTERVAL_MS 60000 // Check battery every 1 minute
 #define LOW_POWER_SLEEP_SEC   900   // 15 minutes deep sleep when low battery
 
