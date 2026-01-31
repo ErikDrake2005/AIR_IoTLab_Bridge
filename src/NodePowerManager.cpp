@@ -59,14 +59,11 @@ bool NodePowerManager::isNodeSleeping() const {
 }
 
 bool NodePowerManager::wakeUpNode() {
-    // Nếu Node đã thức
     if (isNodeAwake()) {
         _state = NODE_STATE_AWAKE;
         _wakeAttempts = 0;
         return true;
     }
-    
-    // Nếu đang trong cooldown
     if (_state == NODE_STATE_COOLDOWN) {
         Serial.println("[NPM] In cooldown, cannot wake");
         return false;
@@ -107,8 +104,6 @@ bool NodePowerManager::wakeUpNode() {
 }
 
 bool NodePowerManager::requestSleep() {
-    // Bridge sẽ gửi lệnh SLEEP qua UART
-    // Hàm này chỉ đánh dấu ý định
     Serial.println("[NPM] Sleep requested for Node");
     return true;
 }
@@ -147,7 +142,6 @@ bool NodePowerManager::_waitForNodeAwake(unsigned long timeoutMs) {
     unsigned long start = millis();
     while (millis() - start < timeoutMs) {
         if (digitalRead(PIN_NODE_STATUS) == HIGH) {
-            // Đợi thêm 100ms để Node ổn định
             vTaskDelay(100 / portTICK_PERIOD_MS);
             return true;
         }
