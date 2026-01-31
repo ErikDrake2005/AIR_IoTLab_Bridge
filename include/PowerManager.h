@@ -29,6 +29,5 @@ private:
     unsigned long _lastCheckMs = 0;
     bool _lowPowerMode = false;
     bool _shouldEnterLowPower = false;
-    
     int _voltageToPercent(float voltage);  // Convert voltage to 0-100%
 };

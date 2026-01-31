@@ -7,10 +7,7 @@ typedef struct { uint8_t payload[512]; size_t length; uint8_t nodeId; } LoraQueu
 
 // Header gói tin LoRa (5 bytes)
 struct PacketHeader { uint8_t nodeId; uint32_t counter; };
-
-// ═══════════════════════════════════════════════════════════════════════
-// FIXED-SCHEMA PACKET TYPES (Tiết kiệm ~70% băng thông LoRa)
-// ═══════════════════════════════════════════════════════════════════════
+// FIXED-SCHEMA PACKET TYPES 
 enum FixedPacketType : uint8_t {
     PKT_UPLINK_DATA      = 0x01,  // Sensor data (23 bytes)
     PKT_UPLINK_STATUS    = 0x02,  // Machine status (13 bytes)
@@ -43,14 +40,14 @@ struct UplinkDataPacket {
 // Removed rssi/snr, added isSleeping
 #pragma pack(push, 1)
 struct UplinkStatusPacket {
-    uint8_t  type;       // = PKT_UPLINK_STATUS (0x02)
-    uint8_t  deviceId;   // Bridge ID
-    uint16_t pinMv;      // Battery voltage in mV
-    uint8_t  isSleeping; // 0=Node awake, 1=Node sleeping
-    uint8_t  flags;      // bit0=mode(0=AUTO,1=MANUAL), bit1=measuring, bit2=door, bit3=fan
-    uint8_t  manualCycle;     // saved_manual_cycle
-    uint8_t  dailyMeasures;   // saved_daily_meansure
-    uint32_t timestamp;  // Unix epoch (local time)
+    uint8_t  type;  
+    uint8_t  deviceId; 
+    uint16_t pinMv;  
+    uint8_t  isSleeping; 
+    uint8_t  flags; 
+    uint8_t  manualCycle;  
+    uint8_t  dailyMeasures; 
+    uint32_t timestamp; 
 };
 #pragma pack(pop)
 
@@ -80,17 +77,16 @@ struct DownlinkTimePacket {
 #pragma pack(pop)
 
 // ── DOWNLINK_CMD: Command packet (10 bytes total) ──
-// Thay thế Legacy Dictionary, tiết kiệm ~80% băng thông
 #pragma pack(push, 1)
 struct DownlinkCmdPacket {
-    uint8_t  type;           // = PKT_DOWNLINK_CMD (0x81)
-    uint8_t  targetId;       // 0=ALL, 1-255=specific Bridge ID
-    uint8_t  en;             // 0=sleep, 1=execute
-    uint8_t  setMode;        // 0=AUTO, 1=MANUAL, 2=TIMESTAMP, 3=SLEEP
-    uint8_t  intervalMin;    // transmissionIntervalMinutes (0=null, 1-59=value)
-    uint8_t  measureCount;   // measurementCount for AUTO (0=null)
-    uint16_t startTimeMin;   // startTime as minutes from 00:00 (0xFFFF=null)
-    uint8_t  doFlags;        // MANUAL: bit0-1=chamber, bit2-3=door, bit4-5=fan
+    uint8_t  type; // = PKT_DOWNLINK_CMD (0x81)
+    uint8_t  targetId; // 0=ALL, 1-255=specific Bridge ID
+    uint8_t  en; // 0=sleep, 1=execute
+    uint8_t  setMode; // 0=AUTO, 1=MANUAL, 2=TIMESTAMP, 3=SLEEP
+    uint8_t  intervalMin; // transmissionIntervalMinutes (0=null, 1-59=value)
+    uint8_t  measureCount; // measurementCount for AUTO (0=null)
+    uint16_t startTimeMin; // startTime as minutes from 00:00 (0xFFFF=null)
+    uint8_t  doFlags; // MANUAL: bit0-1=chamber, bit2-3=door, bit4-5=fan
 };
 #pragma pack(pop)
 
@@ -100,7 +96,7 @@ struct DownlinkCmdPacket {
 #define CMD_FLAG_CHAMBER_NULL    0x00
 #define CMD_FLAG_CHAMBER_STOP    0x01  // stop-measurement
 #define CMD_FLAG_CHAMBER_START   0x02  // start-measurement
-#define CMD_FLAG_DOOR_MASK       0x0C  // bit2-3
+#define CMD_FLAG_DOOR_MASK  0x0C  // bit2-3
 #define CMD_FLAG_DOOR_NULL       0x00
 #define CMD_FLAG_DOOR_CLOSE      0x04  // close
 #define CMD_FLAG_DOOR_OPEN       0x08  // open
@@ -115,9 +111,7 @@ struct DownlinkCmdPacket {
 #define CMD_MODE_TIMESTAMP 2
 #define CMD_MODE_SLEEP     3
 
-// ═══════════════════════════════════════════════════════════════════════
 // LEGACY DICTIONARY ENCODING (Vẫn giữ cho commands và backward compat)
-// ═══════════════════════════════════════════════════════════════════════
 enum DataType : uint8_t { 
     DT_END=0, DT_KEY_TOKEN=1, DT_VAL_TOKEN=2, DT_VAL_INT8=3, DT_VAL_INT16=4, 
     DT_VAL_INT32=5, DT_VAL_FLOAT=6, DT_VAL_RAW_STR=7, DT_OBJ_START=8, DT_OBJ_END=9, DT_NULL=10        

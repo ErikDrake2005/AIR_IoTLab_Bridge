@@ -44,7 +44,6 @@ float PowerManager::getVoltage() {
     if (raw <= 0) {
         return 0.0;
     }
-    
     // Công thức: V_real = V_ADC × K^(-1)
     // V_ADC = raw / 4095 * 3.3V
     // V_real = V_ADC * BAT_DIVIDER (K^-1 = 3.76)
@@ -86,8 +85,6 @@ int PowerManager::_voltageToPercent(float voltage) {
     return (int)percent;
 }
 
-// Detect if battery is connected or external power (adapter) is used
-// Returns true if external power detected (voltage < 2V means battery pins open)
 bool PowerManager::isAdapterConnected() { 
     float v = getCachedVoltage();
     if (v == 0.0) v = getVoltage();
@@ -101,11 +98,9 @@ bool PowerManager::isBatteryLow() {
     }
     float v = getCachedVoltage();
     if (v == 0.0) v = getVoltage();
-    return v < VOLT_LOW_LIMIT;  // < 10.2V (3S LiPo ~33%)
+    return v < VOLT_LOW_LIMIT;  // < 10.2V 
 }
-
-// Check if battery is OK or has recovered
-// Returns true if on external power (battery pins open)
+\
 bool PowerManager::isBatteryOk() {
     if (isAdapterConnected()) {
         // External power detected - always OK
@@ -120,10 +115,8 @@ void PowerManager::deepSleep(uint64_t seconds) {
     Serial.printf("[PWR] Deep Sleep for %llu seconds\n", seconds);
     Serial.flush();
     delay(10);
-    
     esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);
     esp_deep_sleep_start();
-    // Không trở về từ deep sleep - sẽ reset
 }
 
 void PowerManager::lightSleep(uint64_t seconds) {
