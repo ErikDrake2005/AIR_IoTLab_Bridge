@@ -2,9 +2,9 @@
 #include <Arduino.h>
 
 // ========== ĐỊNH DANH =========
-#define BRIDGE_DEVICE_ID "NODE_01" 
+#define BRIDGE_DEVICE_ID "NODE_02" 
 #define TARGET_NODE_ID   "AIR_VL_01" // ID của Node đi kèm (để filter nếu cần)
-#define MY_AES_KEY       "IoTLab@Bridge01" 
+#define MY_AES_KEY       "IoTLab@Bridge02"
 
 // ========== UART KẾT NỐI NODE (QUAN TRỌNG: PHẢI KHỚP NODE) ==========
 #define UART_BAUD       921600   // <--- Đã sửa từ 115200 lên 921600

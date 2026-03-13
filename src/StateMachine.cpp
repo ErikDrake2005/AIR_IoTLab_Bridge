@@ -298,9 +298,9 @@ void StateMachine::_sendToGateway(JsonDocument& doc) {
         Serial.println("[LORA-TX-ERR] Binary Encode Failed");
         return;
     }
-    
+
     PacketHeader header;
-    header.nodeId = 1; 
+    header.nodeId = 2;
     header.counter = millis();
     
     uint8_t encryptedBuf[512];
@@ -318,7 +318,7 @@ void StateMachine::_sendToGateway(JsonDocument& doc) {
 
 void StateMachine::_sendFixedToGateway(uint8_t* data, int len) {
     PacketHeader header;
-    header.nodeId = 1;
+    header.nodeId = 2;
     header.counter = millis();
     
     uint8_t encryptedBuf[128];
