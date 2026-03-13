@@ -126,13 +126,18 @@ void StateMachine::_processLoop() {
                 Serial.printf("[UART-RAW] %s\n", (char*)msg.buf);
                 JsonDocument nodeDoc;
                 DeserializationError err = deserializeJson(nodeDoc, (char*)msg.buf);
-                
+
                 if (err) {
                     Serial.printf("[PROC-ERR] Parse Node JSON failed: %s\n", err.c_str());
                     continue;
                 }
-                // Filter
+                // Filter - bỏ qua gói nội bộ không cần forward lên Gateway
                 const char* nodeType = nodeDoc["type"] | "";
+                if (strlen(nodeType) == 0 || strcmp(nodeType, "ACK") == 0) {
+                    Serial.printf("[PROC] Skipping internal packet (type='%s'), not forwarding to Gateway\n",
+                                  strlen(nodeType) == 0 ? "(none)" : nodeType);
+                    continue;
+                }
                 uint8_t deviceId = 1;
                 const char* lastUnderscore = strrchr(BRIDGE_DEVICE_ID, '_');
                 if (lastUnderscore) {
@@ -290,6 +295,12 @@ void StateMachine::_processLoop() {
     }
 }
 
+// Lấy nodeId từ BRIDGE_DEVICE_ID (VD: "NODE_01" -> 1)
+static uint8_t getBridgeNodeId() {
+    const char* p = strrchr(BRIDGE_DEVICE_ID, '_');
+    return p ? (uint8_t)atoi(p + 1) : 1;
+}
+
 // LoRa Send to Gateway
 void StateMachine::_sendToGateway(JsonDocument& doc) {
     uint8_t binBuf[512];
@@ -300,7 +311,7 @@ void StateMachine::_sendToGateway(JsonDocument& doc) {
     }
 
     PacketHeader header;
-    header.nodeId = 2;
+    header.nodeId = getBridgeNodeId();
     header.counter = millis();
     
     uint8_t encryptedBuf[512];
@@ -318,7 +329,7 @@ void StateMachine::_sendToGateway(JsonDocument& doc) {
 
 void StateMachine::_sendFixedToGateway(uint8_t* data, int len) {
     PacketHeader header;
-    header.nodeId = 2;
+    header.nodeId = getBridgeNodeId();
     header.counter = millis();
     
     uint8_t encryptedBuf[128];
